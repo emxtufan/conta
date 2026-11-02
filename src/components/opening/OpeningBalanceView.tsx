@@ -165,6 +165,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
   const [notes, setNotes] = useState('');
   const [editedValues, setEditedValues] = useState<Record<number, EditableAmounts>>({});
   const [currencyEdits, setCurrencyEdits] = useState<Record<number, CurrencyEdit>>({});
+  const [currencies, setCurrencies] = useState<string[]>(['RON']);
 
   const [activeTab, setActiveTab] = useState<'solduri' | 'terti'>('solduri');
   const [showImport, setShowImport] = useState(false);
@@ -215,6 +216,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
       const data = await api.getOpeningBalance(companyId, fiscalYear);
       applyResult(data);
       setSubsequentOperations(data.subsequent_operations ?? 0);
+      setCurrencies(data.currencies ?? ['RON']);
     } catch (err: any) {
       if (err?.status === 404) {
         setBatch(null);
@@ -480,16 +482,6 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
       setError(describeApiError(err));
     }
   };
-
-  // ---------------------------------------------------------------- valute disponibile pentru terți
-
-  const currencies = Array.from(
-    new Set(
-      [...(batch ? [batch.base_currency] : []), ...lines.map((line) => line.currency)]
-        .map((code) => String(code ?? '').trim().toUpperCase())
-        .filter((code) => code !== '')
-    )
-  );
 
   // ---------------------------------------------------------------- exercițiu fiscal
 
@@ -794,12 +786,11 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
         </div>
       )}
       {batch?.status === 'VALIDATED' && (
-        <div className="flex items-start gap-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40 px-3 py-2 text-xs text-slate-600 dark:text-slate-300">
-          <Info className="w-4 h-4 shrink-0 mt-0.5" />
+        <div className="flex items-start gap-2 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-900/20 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+          <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
           <span>
-            Preluarea este validată
-            {batch.validated_at ? ` la ${new Date(batch.validated_at).toLocaleString('ro-RO')}` : ''}
-            {batch.validated_by_name ? ` de ${batch.validated_by_name}` : ''} — câmpurile sunt read-only.
+            Balanța de pornire este validată. Societatea este pregătită pentru operare contabilă. Valorile nu mai pot fi
+            modificate direct.
           </span>
         </div>
       )}
@@ -813,7 +804,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
         </div>
       )}
 
-      {/* Placeholdere: import / export / istoric */}
+      {/* Modale: import / istoric / copiere societate / repartizare */}
       {batch && (
         <OpeningImportModal
           isOpen={showImport}
@@ -823,33 +814,36 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
           onImported={(r) => applyResult(r)}
         />
       )}
-      {showExport && (
-        <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 px-4 py-3 text-xs text-slate-500">
-          {/* TODO modal: export preluare (PDF / Excel) */}
-          <div className="flex items-center justify-between gap-3">
-            <span className="flex items-center gap-2">
-              <Download className="w-4 h-4" />
-              Exportul soldurilor de preluare se va face dintr-un modal dedicat.
-            </span>
-            <button onClick={() => setShowExport(false)} className="underline">
-              Închide
-            </button>
-          </div>
-        </div>
+      {batch && (
+        <OpeningHistoryModal
+          isOpen={showHistory}
+          onClose={() => setShowHistory(false)}
+          companyId={company.id}
+          batchId={batch.id}
+        />
       )}
-      {showHistory && (
-        <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 px-4 py-3 text-xs text-slate-500">
-          {/* TODO modal: istoric versiuni / log validări */}
-          <div className="flex items-center justify-between gap-3">
-            <span className="flex items-center gap-2">
-              <History className="w-4 h-4" />
-              Istoricul versiunilor și al validărilor se va afișa într-un modal dedicat.
-            </span>
-            <button onClick={() => setShowHistory(false)} className="underline">
-              Închide
-            </button>
-          </div>
-        </div>
+      {batch && (
+        <CompanyCopyModal
+          isOpen={showCopy}
+          onClose={() => setShowCopy(false)}
+          companyId={company.id}
+          batch={batch}
+          onDone={(r) => {
+            applyResult(r);
+            if (r.note) setNotice(r.note);
+          }}
+        />
+      )}
+      {batch && redistributeLine && (
+        <RedistributeModal
+          isOpen
+          onClose={() => setRedistributeLine(null)}
+          companyId={company.id}
+          batch={batch}
+          parentLine={redistributeLine}
+          childLines={descendantLeafLines(redistributeLine)}
+          onDone={(r) => applyResult(r)}
+        />
       )}
 
       {/* Bara de taburi */}
@@ -877,15 +871,15 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
         </button>
       </div>
 
-      {activeTab === 'terti' && (
-        <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 p-8 text-center space-y-2">
-          <Users className="w-10 h-10 text-slate-300 mx-auto" />
-          <h4 className="text-sm font-bold text-slate-700 dark:text-slate-300">Solduri terți la preluare</h4>
-          <p className="text-xs text-slate-500 max-w-md mx-auto">
-            Preluarea soldurilor pe clienți și furnizori (parteneri, documente, sume reziduale) va fi disponibilă în
-            pasul următor. {/* TODO modal: solduri terți la preluare */}
-          </p>
-        </div>
+      {activeTab === 'terti' && batch && (
+        <OpeningCounterpartiesPanel
+          companyId={company.id}
+          batch={batch}
+          lines={lines}
+          currencies={currencies}
+          readOnly={readOnly}
+          onChanged={() => void load()}
+        />
       )}
 
       {activeTab === 'solduri' && (
