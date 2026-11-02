@@ -17,7 +17,9 @@ import {
   OpeningCounterpartyItem,
   OpeningValidationLog,
   OpeningVerificationResult,
-  ImportPreviewResult
+  FileImportPayload,
+  FileImportPreview,
+  OpeningImportRecord
 } from '../types/company';
 
 class ApiService {
@@ -402,12 +404,12 @@ class ApiService {
       lines: Array<{
         account_id: number;
         account_symbol: string;
-        debit_initial: number;
-        credit_initial: number;
-        debit_prev: number;
-        credit_prev: number;
+        debit_initial: number | string;
+        credit_initial: number | string;
+        debit_prev: number | string;
+        credit_prev: number | string;
         currency?: string;
-        currency_amount?: number;
+        currency_amount?: number | string;
         exchange_rate?: number;
         exchange_rate_date?: string | null;
         notes?: string;
@@ -553,23 +555,34 @@ class ApiService {
 
   async previewOpeningImport(
     companyId: number,
-    rows: any[]
-  ): Promise<ImportPreviewResult> {
-    return this.request<ImportPreviewResult>(`/api/companies/${companyId}/opening-balance/import/preview`, {
+    payload: FileImportPayload
+  ): Promise<FileImportPreview> {
+    return this.request<FileImportPreview>(`/api/companies/${companyId}/opening-balance/import/preview`, {
       method: 'POST',
-      body: JSON.stringify({ rows }),
+      body: JSON.stringify(payload),
     });
   }
 
   async commitOpeningImport(
     companyId: number,
-    batchId: number,
-    rows: any[]
-  ): Promise<{ success: boolean; importedCount: number; batch: OpeningBatch }> {
+    payload: FileImportPayload
+  ): Promise<{
+    success: boolean;
+    import_id: number;
+    batch: OpeningBatch;
+    lines: OpeningBalanceLine[];
+    verification: OpeningVerificationResult;
+  }> {
     return this.request(`/api/companies/${companyId}/opening-balance/import/commit`, {
       method: 'POST',
-      body: JSON.stringify({ batch_id: batchId, rows }),
+      body: JSON.stringify(payload),
     });
+  }
+
+  async getOpeningImports(companyId: number, batchId: number): Promise<OpeningImportRecord[]> {
+    return this.request<OpeningImportRecord[]>(
+      `/api/companies/${companyId}/opening-balance/imports?batch_id=${batchId}`
+    );
   }
 
   async copyOpeningBalanceFromCompany(

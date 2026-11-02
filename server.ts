@@ -47,8 +47,6 @@ import {
   getOpeningCounterparties,
   saveOpeningCounterpartyItem,
   deleteOpeningCounterpartyItem,
-  previewOpeningImport,
-  commitOpeningImport,
   copyOpeningBalanceFromCompany,
   getOpeningValidationLogs,
   getOpeningBalances,
@@ -57,7 +55,7 @@ import {
   countSubsequentOperations,
   getAllowedCurrencies
 } from './src/server/openingBalance.js';
-import { parseImportFile, previewHeaders } from './src/server/openingImport.js';
+import { parseImportFile, previewHeaders, previewFileImport, commitFileImport } from './src/server/openingImport.js';
 import { validateCUI, validateIBAN, validateRegCom } from './src/server/validators.js';
 import { runAcceptanceTests } from './src/server/tests.js';
 import { db } from './src/server/db.js';
@@ -67,13 +65,13 @@ const __dirname = path.dirname(__filename);
 
 /**
  * Răspuns de eroare pentru rutele de balanță de pornire.
- * Păstrează codul semantic al erorii: CONFLICT / SUBSEQUENT_OPERATIONS -> 409,
- * FORBIDDEN -> 403, orice altă eroare -> 400.
+ * Păstrează codul semantic al erorii: CONFLICT / SUBSEQUENT_OPERATIONS /
+ * CONFIRMATION_REQUIRED -> 409, FORBIDDEN -> 403, orice altă eroare -> 400.
  */
 function sendOpeningError(res: Response, err: any) {
   const code = err && typeof err.code === 'string' ? err.code : null;
   let status = 400;
-  if (code === 'CONFLICT' || code === 'SUBSEQUENT_OPERATIONS') {
+  if (code === 'CONFLICT' || code === 'SUBSEQUENT_OPERATIONS' || code === 'CONFIRMATION_REQUIRED') {
     status = 409;
   } else if (code === 'FORBIDDEN') {
     status = 403;
@@ -844,11 +842,9 @@ async function startServer() {
         return res.status(403).json({ error: 'Acces interzis.' });
       }
 
-      const { rows } = req.body;
-      const preview = previewOpeningImport(companyId, rows || []);
-      res.json(preview);
+      res.json(previewFileImport(companyId, req.body));
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
     }
   });
 
@@ -859,9 +855,36 @@ async function startServer() {
         return res.status(403).json({ error: 'Acces interzis.' });
       }
 
-      const { batch_id, rows } = req.body;
-      const result = commitOpeningImport(companyId, batch_id, rows || [], req.user!.id, req.user!.full_name);
-      res.json(result);
+      const r = commitFileImport(companyId, req.body, req.user!.id, req.user!.full_name);
+      res.json({
+        ...r,
+        lines: getOpeningBalanceLines(r.batch.id, companyId),
+        verification: verifyOpeningBalance(companyId, r.batch.id)
+      });
+    } catch (err: any) {
+      sendOpeningError(res, err);
+    }
+  });
+
+  app.get('/api/companies/:id/opening-balance/imports', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Acces interzis.' });
+      }
+
+      const batchId = parseInt(req.query.batch_id as string, 10);
+      if (!batchId || Number.isNaN(batchId)) {
+        return res.status(400).json({ error: 'Parametrul batch_id este obligatoriu.' });
+      }
+
+      const imports = db.prepare(`
+        SELECT *
+        FROM accounting_opening_imports
+        WHERE batch_id = ? AND company_id = ?
+        ORDER BY id DESC
+      `).all(batchId, companyId);
+      res.json(imports);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
     }

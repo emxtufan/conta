@@ -1096,8 +1096,9 @@ export function commitFileImport(
     throw new ImportError('Lotul de preluare a balanței nu există.', 'VALIDATION');
   }
 
-  // 2. Blocare optimistă: lotul nu trebuie să fi fost modificat între timp
-  if (payload.version !== undefined && payload.version !== batch.version) {
+  // 2. Blocare optimistă: versiunea din payload este obligatorie și trebuie să
+  // corespundă versiunii lotului (lotul nu trebuie să fi fost modificat între timp)
+  if (payload.version === undefined || payload.version !== batch.version) {
     throw new ImportError('Balanța a fost modificată între timp. Reîncărcați.', 'CONFLICT');
   }
 

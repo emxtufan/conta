@@ -435,4 +435,104 @@ export interface ImportPreviewResult {
   };
 }
 
+// =========================================================================
+// IMPORT FIȘIER (CSV / XLSX) — oglindă a tipurilor din src/server/openingImport.ts
+// =========================================================================
+
+/** Formatul numerelor din fișier: RO = „1.234,56”, EN = „1,234.56”. */
+export type AmountFormat = 'RO' | 'EN';
+
+/** Tipul fișierului sursă. */
+export type ImportSourceType = 'CSV' | 'XLSX';
+
+/** Indici de coloană 0-based; câmpurile opționale lipsesc dacă nu sunt mapate. */
+export type ImportMapping = {
+  account: number;
+  name?: number;
+  debit_initial: number;
+  credit_initial: number;
+  debit_prev: number;
+  credit_prev: number;
+  currency?: number;
+  currency_amount?: number;
+};
+
+/** Datele primite de la client pentru previzualizarea unui import de fișier. */
+export type FileImportPayload = {
+  batch_id: number;
+  file_name: string;
+  content_base64: string;
+  mapping: ImportMapping;
+  has_header: boolean;
+  number_format: AmountFormat;
+  version?: number;
+  confirm_replace?: boolean;
+  confirm_reimport?: boolean;
+};
+
+export type FileImportRowStatus = 'OK' | 'WARNING' | 'ERROR' | 'SKIPPED';
+
+/** Un rând din previzualizare, cu sumele exprimate în lei. */
+export type FileImportRow = {
+  row_no: number;
+  symbol: string;
+  name: string;
+  account_id: number | null;
+  debit_initial: number;
+  credit_initial: number;
+  debit_prev: number;
+  credit_prev: number;
+  currency: string;
+  currency_amount: number;
+  status: FileImportRowStatus;
+  messages: string[];
+};
+
+/** Importul deja commitat care are aceeași amprentă de conținut. */
+export type FileImportDuplicate = {
+  id: number;
+  created_at: string;
+  user_name: string | null;
+};
+
+export type FileImportPreview = {
+  source_type: ImportSourceType;
+  rows: FileImportRow[];
+  errors: string[];
+  warnings: string[];
+  totals: {
+    debit_initial: number;
+    credit_initial: number;
+    debit_prev: number;
+    credit_prev: number;
+  };
+  is_balanced: boolean;
+  content_hash: string;
+  duplicate_of: FileImportDuplicate | null;
+  existing_lines_count: number;
+  can_commit: boolean;
+};
+
+/** Un import înregistrat în istoricul lotului (tabela accounting_opening_imports). */
+export type OpeningImportRecord = {
+  id: number;
+  company_id: number;
+  batch_id: number;
+  fiscal_year: number;
+  source_type: 'CSV' | 'XLSX' | 'COMPANY_COPY' | 'ROWS';
+  file_name: string;
+  content_hash: string;
+  source_company_id: number | null;
+  row_count: number;
+  total_debit_initial: number;
+  total_credit_initial: number;
+  total_debit_prev: number;
+  total_credit_prev: number;
+  status: 'COMMITTED' | 'SUPERSEDED';
+  user_id: number | null;
+  user_name: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 
