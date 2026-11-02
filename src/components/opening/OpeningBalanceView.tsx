@@ -24,6 +24,7 @@ import {
 } from '../../types/company';
 import { AnalyticAccountModal } from '../accounting/AnalyticAccountModal';
 import { CurrencyDetailsModal } from './CurrencyDetailsModal';
+import { OpeningImportModal } from './OpeningImportModal';
 
 // =========================================================================
 // CONSTANTE
@@ -566,7 +567,27 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
           </label>
           <button
             onClick={() => setShowImport((v) => !v)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+            disabled={
+              !batch ||
+              batch.batch_type === 'NO_ACTIVITY' ||
+              readOnly ||
+              batch.setup_completed === 0 ||
+              dirtyIds.length > 0
+            }
+            title={
+              !batch
+                ? 'Configurați mai întâi preluarea soldurilor.'
+                : batch.batch_type === 'NO_ACTIVITY'
+                  ? 'Societatea fără activitate nu are solduri de preluare.'
+                  : readOnly
+                    ? 'Preluarea este validată — câmpurile sunt read-only.'
+                    : batch.setup_completed === 0
+                      ? 'Finalizați configurarea preluării înainte de import.'
+                      : dirtyIds.length > 0
+                        ? `Salvați cele ${dirtyIds.length} modificări nesalvate înainte de import.`
+                        : 'Importați soldurile de preluare din fișier CSV / XLSX'
+            }
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
           >
             <Upload className="w-3.5 h-3.5" />
             Import
@@ -669,19 +690,14 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
       )}
 
       {/* Placeholdere: import / export / istoric */}
-      {showImport && (
-        <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 px-4 py-3 text-xs text-slate-500">
-          {/* TODO modal: import preluare (balanță de verificare / fișier) */}
-          <div className="flex items-center justify-between gap-3">
-            <span className="flex items-center gap-2">
-              <Upload className="w-4 h-4" />
-              Importul soldurilor de preluare se va face dintr-un modal dedicat.
-            </span>
-            <button onClick={() => setShowImport(false)} className="underline">
-              Închide
-            </button>
-          </div>
-        </div>
+      {batch && (
+        <OpeningImportModal
+          isOpen={showImport}
+          onClose={() => setShowImport(false)}
+          companyId={company.id}
+          batch={batch}
+          onImported={(r) => applyResult(r)}
+        />
       )}
       {showExport && (
         <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 px-4 py-3 text-xs text-slate-500">
