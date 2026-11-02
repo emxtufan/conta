@@ -57,6 +57,7 @@ import {
   countSubsequentOperations,
   getAllowedCurrencies
 } from './src/server/openingBalance.js';
+import { parseImportFile, previewHeaders } from './src/server/openingImport.js';
 import { validateCUI, validateIBAN, validateRegCom } from './src/server/validators.js';
 import { runAcceptanceTests } from './src/server/tests.js';
 import { db } from './src/server/db.js';
