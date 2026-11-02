@@ -143,6 +143,41 @@ export function parseRomanianNumber(val: any): number {
 }
 
 // =========================================================================
+// HELPERE MONEDE (LISTA MONEDELOR PERMISE PENTRU O SOCIETATE)
+// =========================================================================
+
+/**
+ * Returnează lista monedelor permise pentru o societate: monedele standard
+ * (RON, EUR, USD, GBP, CHF), moneda contabilă a societății și monedele
+ * conturilor bancare configurate. Rezultatul este unic, sortat, cu RON primul.
+ */
+export function getAllowedCurrencies(companyId: number): string[] {
+  const standard = ['RON', 'EUR', 'USD', 'GBP', 'CHF'];
+
+  const company = db
+    .prepare('SELECT currency FROM companies WHERE id = ?')
+    .get(companyId) as { currency: string | null } | undefined;
+  const bankAccounts = db
+    .prepare('SELECT DISTINCT currency FROM company_bank_accounts WHERE company_id = ?')
+    .all(companyId) as { currency: string | null }[];
+
+  const unique = new Set<string>(standard);
+  if (company && company.currency) {
+    const companyCurrency = String(company.currency).trim().toUpperCase();
+    if (companyCurrency) unique.add(companyCurrency);
+  }
+  for (const row of bankAccounts) {
+    if (row.currency) {
+      const bankCurrency = String(row.currency).trim().toUpperCase();
+      if (bankCurrency) unique.add(bankCurrency);
+    }
+  }
+
+  const rest = Array.from(unique).filter(c => c !== 'RON').sort();
+  return ['RON', ...rest];
+}
+
+// =========================================================================
 // 1. GESTIONARE LOT PRELUARE (BATCH)
 // =========================================================================
 
@@ -406,6 +441,22 @@ export function getOpeningBalanceLines(batchId: number, companyId: number): Open
         const diffBani = childDebitPrevBani - childCreditPrevBani;
         line.debit_final = fromBani(diffBani > 0 ? diffBani : 0);
         line.credit_final = fromBani(diffBani < 0 ? -diffBani : 0);
+
+        // Agregare valută: suma în valută se totalizează doar dacă toți copiii
+        // cu sumă în valută sunt în aceeași monedă; altfel nu se amestecă valutele.
+        const childrenWithCurrency = children.filter(c => toBani(c.currency_amount) !== 0);
+        const childCurrencies = Array.from(new Set(
+          childrenWithCurrency.map(c => String(c.currency || '').trim().toUpperCase())
+        ));
+
+        if (childCurrencies.length === 1) {
+          line.currency = childCurrencies[0];
+          const childCurrencyAmountBani = childrenWithCurrency.reduce((sum, c) => sum + toBani(c.currency_amount), 0);
+          line.currency_amount = fromBani(childCurrencyAmountBani);
+        } else {
+          line.currency = '';
+          line.currency_amount = 0;
+        }
       }
     }
   }
@@ -426,6 +477,10 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
   const lines = getOpeningBalanceLines(batchId, companyId);
   const errors: string[] = [];
   const warnings: string[] = [];
+
+  // Moneda contabilă de referință și monedele permise pentru societate
+  const baseCurrency = String(batch.base_currency || 'RON').trim().toUpperCase();
+  const allowedCurrencies = getAllowedCurrencies(companyId);
 
   // Pentru calculul balanței se iau în considerare fie liniile frunză (analitice), fie sinteticele fără analitice.
   // Evităm dubla adunare a sinteticelor agregate!
@@ -469,6 +524,55 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
       const dbSaved = db.prepare('SELECT * FROM accounting_opening_balance_lines WHERE batch_id = ? AND account_id = ?').get(batchId, line.account_id) as any;
       if (dbSaved && (dbSaved.debit_initial > 0 || dbSaved.credit_initial > 0 || dbSaved.debit_prev > 0 || dbSaved.credit_prev > 0)) {
         errors.push(`Contul sintetic ${line.account_symbol} conține solduri introduse direct, deși există conturi analitice configurate. Introduceți soldurile exclusiv pe conturile analitice.`);
+      }
+    }
+
+    // 5. Verificări valutare (doar pe liniile de detaliu, nu pe totalizatoarele agregate)
+    if (!line.is_synthetic_summary) {
+      const lineCurrency = String(line.currency || 'RON').trim().toUpperCase();
+      const currencyAmountBani = toBani(line.currency_amount);
+      const debitFinalBani = toBani(line.debit_final);
+      const creditFinalBani = toBani(line.credit_final);
+      // Soldul RON al liniei: debitor dacă există, altfel creditor
+      const soldBani = debitFinalBani !== 0 ? debitFinalBani : creditFinalBani;
+      const rate = Number(line.exchange_rate) || 0;
+
+      if (lineCurrency === baseCurrency) {
+        if (currencyAmountBani !== 0) {
+          warnings.push(`Cont ${line.account_symbol}: suma în valută ignorată pentru moneda contabilă.`);
+        }
+      } else {
+        if (!allowedCurrencies.includes(lineCurrency)) {
+          errors.push(`Cont ${line.account_symbol}: moneda ${lineCurrency} nu este configurată.`);
+        }
+
+        if (soldBani !== 0 && currencyAmountBani === 0) {
+          errors.push(`Cont ${line.account_symbol}: lipsește suma în valută originală.`);
+        }
+
+        if (currencyAmountBani !== 0 && soldBani === 0) {
+          errors.push(`Cont ${line.account_symbol}: suma în valută nu are echivalent contabil în ${baseCurrency}.`);
+        }
+
+        if (rate > 0 && rate !== 1) {
+          if (!line.exchange_rate_date) {
+            warnings.push(`Cont ${line.account_symbol}: lipsește data cursului.`);
+          }
+
+          // Echivalentul RON estimat cu cursul liniei (4 zecimale, rotunjire half-up),
+          // exclusiv pentru avertizare — nu se recalculează automat soldul.
+          const rateE4 = Math.round(rate * 10000);
+          const product = BigInt(currencyAmountBani) * BigInt(rateE4);
+          const expectedBani = product >= 0n
+            ? (product + 5000n) / 10000n
+            : -((-product + 5000n) / 10000n);
+          const differenceBani = expectedBani - BigInt(soldBani);
+          const absDifferenceBani = differenceBani < 0n ? -differenceBani : differenceBani;
+
+          if (absDifferenceBani > 100n) {
+            warnings.push(`Cont ${line.account_symbol}: echivalentul RON (${fromBani(soldBani).toFixed(2)}) diferă de suma în valută × curs (${fromBani(Number(expectedBani)).toFixed(2)}).`);
+          }
+        }
       }
     }
 

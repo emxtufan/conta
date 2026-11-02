@@ -379,6 +379,7 @@ class ApiService {
     lines: OpeningBalanceLine[];
     verification: OpeningVerificationResult;
     subsequent_operations: number;
+    currencies: string[];
   }> {
     const qs = year ? `?year=${year}` : '';
     return this.request<{
@@ -386,6 +387,7 @@ class ApiService {
       lines: OpeningBalanceLine[];
       verification: OpeningVerificationResult;
       subsequent_operations: number;
+      currencies: string[];
     }>(`/api/companies/${companyId}/opening-balance${qs}`);
   }
 

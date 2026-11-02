@@ -53,7 +53,8 @@ import {
   getOpeningBalances,
   setupOpeningBatch,
   markVerificationStatus,
-  countSubsequentOperations
+  countSubsequentOperations,
+  getAllowedCurrencies
 } from './src/server/openingBalance.js';
 import { validateCUI, validateIBAN, validateRegCom } from './src/server/validators.js';
 import { runAcceptanceTests } from './src/server/tests.js';
@@ -622,7 +623,7 @@ async function startServer() {
       const verification = verifyOpeningBalance(companyId, batch.id);
       const subsequent_operations = countSubsequentOperations(companyId, year);
 
-      res.json({ batch, lines, verification, subsequent_operations });
+      res.json({ batch, lines, verification, subsequent_operations, currencies: getAllowedCurrencies(companyId) });
     } catch (err: any) {
       sendOpeningError(res, err);
     }
