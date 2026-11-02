@@ -498,6 +498,8 @@ export function initDatabase() {
   ensureColumn('accounting_opening_counterparty_items', 'created_at', 'TEXT');
   ensureColumn('accounting_opening_counterparty_items', 'updated_at', 'TEXT');
   ensureColumn('accounting_opening_counterparty_items', 'created_by', 'INTEGER REFERENCES users(id)');
+  // Soldul în moneda de bază al documentului, folosit la justificarea soldului contului
+  ensureColumn('accounting_opening_counterparty_items', 'remaining_amount_ron', 'REAL NOT NULL DEFAULT 0');
 
   // Index unic pe documentele de terți; duplicatele istorice nu blochează pornirea aplicației
   try {
