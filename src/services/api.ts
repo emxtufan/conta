@@ -530,6 +530,27 @@ class ApiService {
     );
   }
 
+  async parseOpeningImportFile(
+    companyId: number,
+    fileName: string,
+    contentBase64: string
+  ): Promise<{
+    source_type: 'CSV' | 'XLSX';
+    columns: { index: number; label: string }[];
+    sample: string[][];
+    row_count: number;
+  }> {
+    return this.request<{
+      source_type: 'CSV' | 'XLSX';
+      columns: { index: number; label: string }[];
+      sample: string[][];
+      row_count: number;
+    }>(`/api/companies/${companyId}/opening-balance/import/parse`, {
+      method: 'POST',
+      body: JSON.stringify({ file_name: fileName, content_base64: contentBase64 }),
+    });
+  }
+
   async previewOpeningImport(
     companyId: number,
     rows: any[]

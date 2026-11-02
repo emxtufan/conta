@@ -88,7 +88,7 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '15mb' }));
 
   // ----------------------------------------------------
   // RUTE DE AUTENTIFICARE
@@ -818,6 +818,21 @@ async function startServer() {
       res.json(result);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/companies/:id/opening-balance/import/parse', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Acces interzis.' });
+      }
+
+      const { file_name, content_base64 } = req.body;
+      const { source_type, rows } = parseImportFile(file_name, content_base64);
+      res.json({ source_type, ...previewHeaders(rows), row_count: rows.length });
+    } catch (err: any) {
+      sendOpeningError(res, err);
     }
   });
 
