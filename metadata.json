@@ -1,0 +1,6 @@
+{
+  "name": "Manual SAGA C - Cuprins și Ghid Oficial",
+  "description": "Structura completă a manualului oficial SAGA C: Cuprinsul meniului Content cu 11 capitole principale, 98 de intrări și 3 niveluri, navigare detaliată, monografii contabile și linkuri oficiale.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

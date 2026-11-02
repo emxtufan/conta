@@ -1,0 +1,6 @@
+{
+  "summary":  "Plan de implementare pentru Etapa 1 a aplicației Contabilitate RO: arhitectura completă a platformei (Full-Stack cu Node.js Express și SQLite server-side persistent), autentificare securizată cu sesiuni, meniu lateral ERP conform structurii de contabilitate românească, izolarea strictă a datelor între societăți, selectorul societății active și modulul complet Configurare Societăți cu formular pe 6 taburi, validări sintactice CUI/IBAN/CAEN, istoric fiscal fără suprapuneri și control concurențial cu blocare optimistă.",
+  "updatedAt":  "2026-11-02T11:59:41.588302618Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
