@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\\\Program Files\\\\nodejs\\\\node.exe\" \"C:\\\\AiTools\\\\boss-worker\\\\map\\\\build-map.mjs\" \"C:\\\\Users\\\\GPRO\\\\OneDrive - Greentech Professionals SRL\\\\Desktop\\\\Saga Clonner\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "deepseek-worker"
+  ],
+  "permissions": {
+    "deny": [
+      "Edit",
+      "Write",
+      "NotebookEdit"
+    ]
+  }
+}

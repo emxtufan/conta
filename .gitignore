@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# boss-worker
+.ai/worker-log.jsonl
+.ai/worker-live.log
+.ai/worker-watch.pid
+.ai/summaries-cache.json
+.ai/CODEMAP.md
+.ai/codemap.json
+__pycache__/

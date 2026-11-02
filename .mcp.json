@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "deepseek-worker": {
+      "command": "C:\\Program Files\\nodejs\\node.exe",
+      "args": [
+        "C:\\AiTools\\boss-worker\\worker\\server.mjs"
+      ],
+      "env": {
+        "PROJECT_ROOT": "C:\\Users\\GPRO\\OneDrive - Greentech Professionals SRL\\Desktop\\Saga Clonner"
+      }
+    }
+  }
+}
