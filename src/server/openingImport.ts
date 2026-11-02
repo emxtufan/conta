@@ -1043,3 +1043,202 @@ export function previewFileImport(companyId: number, payload: FileImportPayload)
     can_commit: canCommit
   };
 }
+
+// =========================================================================
+// 5. SALVAREA IMPORTULUI ÎN BALANȚA DE PORNIRE
+// =========================================================================
+
+/** Lotul de preluare, redus la câmpurile necesare salvării importului. */
+type CommitBatchRow = {
+  id: number;
+  company_id: number;
+  fiscal_year: number;
+  status: BatchStatus;
+  version: number;
+};
+
+/** Rezultatul salvării unui import de fișier în balanța de pornire. */
+export type FileImportCommitResult = {
+  success: true;
+  import_id: number;
+  batch: any;
+};
+
+/**
+ * Salvează în balanța de pornire rândurile valide ale unui fișier importat.
+ *
+ * Se reia integral previzualizarea (aceleași validări ca la pasul anterior), apoi,
+ * într-o singură tranzacție: importurile anterioare cu altă amprentă devin istorice
+ * (SUPERSEDED), se înregistrează importul curent, liniile lotului sunt înlocuite cu
+ * rândurile OK/WARNING din fișier, totalurile lotului sunt recalculate, iar versiunea
+ * lotului este incrementată. Soldurile terților nu sunt atinse.
+ */
+export function commitFileImport(
+  companyId: number,
+  payload: FileImportPayload,
+  userId: number,
+  userName: string
+): FileImportCommitResult {
+  // 1. Aceleași validări ca la previzualizare
+  const preview = previewFileImport(companyId, payload);
+
+  if (!preview.can_commit) {
+    throw new ImportError('Importul conține erori; nu s-a salvat nimic.', 'VALIDATION');
+  }
+
+  const batch = db.prepare(`
+    SELECT id, company_id, fiscal_year, status, version
+    FROM accounting_opening_batches
+    WHERE id = ? AND company_id = ?
+  `).get(payload.batch_id, companyId) as CommitBatchRow | undefined;
+
+  if (!batch) {
+    throw new ImportError('Lotul de preluare a balanței nu există.', 'VALIDATION');
+  }
+
+  // 2. Blocare optimistă: lotul nu trebuie să fi fost modificat între timp
+  if (payload.version !== undefined && payload.version !== batch.version) {
+    throw new ImportError('Balanța a fost modificată între timp. Reîncărcați.', 'CONFLICT');
+  }
+
+  // 3. Confirmări explicite pentru reimport și pentru înlocuirea soldurilor existente
+  if (preview.duplicate_of && !payload.confirm_reimport) {
+    throw new ImportError(
+      `Același conținut a fost deja importat la ${preview.duplicate_of.created_at} de ${preview.duplicate_of.user_name || 'utilizator necunoscut'}. Confirmați reimportul (valorile se înlocuiesc, nu se adună).`,
+      'CONFIRMATION_REQUIRED'
+    );
+  }
+
+  if (preview.existing_lines_count > 0 && !payload.confirm_replace) {
+    throw new ImportError(
+      `Balanța conține deja ${preview.existing_lines_count} conturi cu solduri. Confirmați înlocuirea lor cu valorile din fișier.`,
+      'CONFIRMATION_REQUIRED'
+    );
+  }
+
+  const rowsToImport = preview.rows.filter(row => row.status === 'OK' || row.status === 'WARNING');
+  const now = new Date().toISOString();
+
+  let importId = 0;
+
+  const tx = db.transaction(() => {
+    // 4. Importurile anterioare cu altă amprentă de conținut devin istorice
+    db.prepare(`
+      UPDATE accounting_opening_imports SET
+        status = 'SUPERSEDED',
+        updated_at = ?
+      WHERE batch_id = ? AND status = 'COMMITTED' AND content_hash != ?
+    `).run(now, batch.id, preview.content_hash);
+
+    if (preview.duplicate_of) {
+      // Reimport confirmat: se reactivează rândul existent, cu același conținut
+      db.prepare(`
+        UPDATE accounting_opening_imports SET
+          status = 'COMMITTED',
+          user_id = ?,
+          user_name = ?,
+          updated_at = ?
+        WHERE id = ?
+      `).run(userId, userName, now, preview.duplicate_of.id);
+
+      importId = preview.duplicate_of.id;
+    } else {
+      const inserted = db.prepare(`
+        INSERT INTO accounting_opening_imports (
+          company_id, batch_id, fiscal_year, source_type, file_name, content_hash,
+          row_count, total_debit_initial, total_credit_initial, total_debit_prev,
+          total_credit_prev, status, user_id, user_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?, ?, ?)
+      `).run(
+        companyId,
+        batch.id,
+        batch.fiscal_year,
+        preview.source_type,
+        payload.file_name,
+        preview.content_hash,
+        rowsToImport.length,
+        preview.totals.debit_initial,
+        preview.totals.credit_initial,
+        preview.totals.debit_prev,
+        preview.totals.credit_prev,
+        userId,
+        userName,
+        now,
+        now
+      );
+
+      importId = Number(inserted.lastInsertRowid);
+    }
+
+    // 5. Liniile lotului sunt înlocuite cu valorile din fișier
+    db.prepare('DELETE FROM accounting_opening_balance_lines WHERE batch_id = ?').run(batch.id);
+
+    const insertStmt = db.prepare(`
+      INSERT INTO accounting_opening_balance_lines (
+        batch_id, account_id, account_symbol, debit_initial, credit_initial,
+        debit_prev, credit_prev, currency, currency_amount, exchange_rate,
+        notes, value_source, source_import_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, '', 'IMPORT', ?, ?, ?)
+    `);
+
+    for (const row of rowsToImport) {
+      insertStmt.run(
+        batch.id,
+        row.account_id,
+        row.symbol,
+        row.debit_initial,
+        row.credit_initial,
+        row.debit_prev,
+        row.credit_prev,
+        row.currency,
+        row.currency_amount,
+        importId,
+        now,
+        now
+      );
+    }
+
+    // 6. Totalurile lotului se aliniază cu valorile importate
+    db.prepare(`
+      UPDATE accounting_opening_batches SET
+        total_debit_initial = ?,
+        total_credit_initial = ?,
+        total_debit_prev = ?,
+        total_credit_prev = ?,
+        status = 'DRAFT',
+        version = version + 1,
+        updated_at = ?
+      WHERE id = ?
+    `).run(
+      preview.totals.debit_initial,
+      preview.totals.credit_initial,
+      preview.totals.debit_prev,
+      preview.totals.credit_prev,
+      now,
+      batch.id
+    );
+
+    // 7. Urmă de audit pentru import
+    const details = JSON.stringify({
+      file_name: payload.file_name,
+      content_hash: preview.content_hash,
+      rows: rowsToImport.length,
+      import_id: importId,
+      replaced: preview.existing_lines_count
+    });
+
+    db.prepare(`
+      INSERT INTO accounting_opening_validation_logs (
+        batch_id, action, user_id, user_name, reason, details, created_at
+      ) VALUES (?, 'IMPORT', ?, ?, 'Import fișier CSV / Excel', ?, ?)
+    `).run(batch.id, userId || null, userName || 'Sistem', details, now);
+  });
+
+  tx();
+
+  const updatedBatch = db
+    .prepare('SELECT * FROM accounting_opening_batches WHERE id = ?')
+    .get(batch.id);
+
+  return { success: true, import_id: importId, batch: updatedBatch };
+}
