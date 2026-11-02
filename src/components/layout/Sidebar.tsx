@@ -21,6 +21,7 @@ export type ActiveView =
   | 'companies'
   | 'automatic_accounts'
   | 'settings_diverse'
+  | 'opening_balance'
   | 'help_saga';
 
 interface SidebarProps {

@@ -56,6 +56,10 @@ const STATUS_LABELS: Record<string, string> = {
   VALIDATED: 'Validat',
 };
 
+// Exercițiile fiscale disponibile în selectorul din antet: an curent −2 … +1
+const CURRENT_YEAR = new Date().getFullYear();
+const FISCAL_YEAR_OPTIONS = Array.from({ length: 4 }, (_, index) => CURRENT_YEAR - 2 + index);
+
 // =========================================================================
 // HELPERE NUMERICE / FORMATARE
 // =========================================================================
@@ -177,6 +181,8 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     batch_type: 'YEAR_START',
   });
 
+  const [fiscalYear, setFiscalYear] = useState<number>(new Date().getFullYear());
+
   const readOnly = batch?.status === 'VALIDATED';
 
   // ---------------------------------------------------------------- încărcare
@@ -198,7 +204,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     setLoading(true);
     setError(null);
     try {
-      const data = await api.getOpeningBalance(companyId);
+      const data = await api.getOpeningBalance(companyId, fiscalYear);
       applyResult(data);
       setSubsequentOperations(data.subsequent_operations ?? 0);
     } catch (err: any) {
@@ -215,7 +221,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     } finally {
       setLoading(false);
     }
-  }, [companyId, applyResult]);
+  }, [companyId, fiscalYear, applyResult]);
 
   useEffect(() => {
     void load();
@@ -233,7 +239,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
         fiscal_year: setupForm.fiscal_year,
         start_month: setupForm.start_month,
         batch_type: setupForm.batch_type,
-        version: 0,
+        version: batch?.version ?? 0,
       });
       applyResult(data);
       setSubsequentOperations(0);
@@ -418,6 +424,19 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     new Set([...Object.keys(editedValues).map((k) => Number(k)), ...Object.keys(currencyEdits).map((k) => Number(k))])
   );
 
+  // ---------------------------------------------------------------- exercițiu fiscal
+
+  const handleFiscalYearChange = (year: number) => {
+    if (year === fiscalYear) return;
+    if (dirtyIds.length > 0) {
+      const confirmed = window.confirm(
+        `Există ${dirtyIds.length} modificări nesalvate pentru exercițiul ${fiscalYear}. Dacă schimbați exercițiul fiscal, acestea se vor pierde. Continuați?`
+      );
+      if (!confirmed) return;
+    }
+    setFiscalYear(year);
+  };
+
   const handleSave = async () => {
     if (!companyId || !batch) return;
     if (readOnly) {
@@ -530,6 +549,21 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+            <span>Exercițiu</span>
+            <select
+              value={fiscalYear}
+              onChange={(e) => handleFiscalYearChange(Number(e.target.value))}
+              disabled={loading || saving}
+              className="px-2 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 disabled:opacity-50"
+            >
+              {FISCAL_YEAR_OPTIONS.map((year) => (
+                <option key={year} value={year}>
+                  {year}
+                </option>
+              ))}
+            </select>
+          </label>
           <button
             onClick={() => setShowImport((v) => !v)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
