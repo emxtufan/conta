@@ -563,6 +563,51 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     }
   };
 
+  /**
+   * Șterge soldurile introduse direct pe contul sintetic atunci când acestea se
+   * suprapun cu analiticele. Se trimit doar valorile zero pentru linia sintetică.
+   */
+  const handleClearSynthetic = async (target: OpeningBalanceLine) => {
+    if (!companyId || !batch) return;
+    if (readOnly) {
+      setError('Preluarea este validată și nu mai poate fi modificată. Anulați validarea pentru a o edita.');
+      return;
+    }
+    if (dirtyIds.length > 0) {
+      setError(`Salvați întâi modificările: există ${dirtyIds.length} valori nesalvate.`);
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const data = await api.saveOpeningBalance(companyId, {
+        batch_id: batch.id,
+        batch_type: batch.batch_type,
+        start_month: batch.start_month,
+        notes,
+        version: batch.version,
+        lines: [
+          {
+            account_id: target.account_id,
+            account_symbol: target.account_symbol,
+            debit_initial: '0',
+            credit_initial: '0',
+            debit_prev: '0',
+            credit_prev: '0',
+          },
+        ],
+      } as any);
+      applyResult(data);
+      setNotice(`Soldul introdus direct pe ${target.account_symbol} a fost șters (versiunea ${data.version}).`);
+    } catch (err: any) {
+      setError(describeApiError(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   // ---------------------------------------------------------------- guard
 
   if (!company) {
@@ -1000,6 +1045,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
                         const amounts = effectiveAmounts(line);
                         const sold = soldFor(amounts);
                         const isSummary = line.is_synthetic_summary === true;
+                        const ownValues = line.own_values ?? null;
                         const deRepartizat = needsDistribution(line);
                         const isAnalytic = line.account_type === 'ANALYTIC';
                         return (
@@ -1035,6 +1081,31 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
                                       Repartizează
                                     </button>
                                   )
+                                )}
+                                {isSummary && ownValues && (
+                                  <>
+                                    <span
+                                      title={`Soldul introdus direct pe ${line.account_symbol} (D ${fmt(ownValues.debit_initial)} · C ${fmt(ownValues.credit_initial)} · D perioadă ${fmt(ownValues.debit_prev)} · C perioadă ${fmt(ownValues.credit_prev)}) se suprapune cu analiticele.`}
+                                      className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 text-[10px] font-semibold whitespace-nowrap"
+                                    >
+                                      Dublare sintetic/analitic
+                                    </span>
+                                    {!readOnly && (
+                                      <button
+                                        type="button"
+                                        onClick={() => void handleClearSynthetic(line)}
+                                        disabled={saving || dirtyIds.length > 0}
+                                        title={
+                                          dirtyIds.length > 0
+                                            ? `Salvați cele ${dirtyIds.length} modificări nesalvate înainte de a șterge soldul sintetic.`
+                                            : 'Șterge valorile introduse direct pe contul sintetic; analiticele rămân neschimbate.'
+                                        }
+                                        className="px-1.5 py-0.5 rounded bg-red-50 text-red-700 hover:bg-red-100 dark:bg-red-900/30 dark:text-red-300 dark:hover:bg-red-900/60 text-[10px] font-semibold whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                      >
+                                        Șterge soldul sintetic
+                                      </button>
+                                    )}
+                                  </>
                                 )}
                               </span>
                             </td>
