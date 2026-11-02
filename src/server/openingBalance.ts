@@ -714,24 +714,23 @@ export function saveOpeningBalanceLines(
   const nextVersion = currentBatch.version + 1;
 
   const tx = db.transaction(() => {
-    // 1. Actualizare detalii batch
+    // 1. Actualizare detalii batch (tipul și luna de start se stabilesc doar la configurare)
     db.prepare(`
       UPDATE accounting_opening_batches SET
-        batch_type = ?,
-        start_month = ?,
         notes = ?,
+        status = 'DRAFT',
         version = ?,
         updated_at = ?
       WHERE id = ?
-    `).run(data.batch_type, data.start_month, data.notes || '', nextVersion, now, batchId);
+    `).run(data.notes || '', nextVersion, now, batchId);
 
     // 2. Pregătire upsert pentru fiecare cont cu valori nenule
     const upsertStmt = db.prepare(`
       INSERT INTO accounting_opening_balance_lines (
         batch_id, account_id, account_symbol, debit_initial, credit_initial,
         debit_prev, credit_prev, currency, currency_amount, exchange_rate,
-        exchange_rate_date, notes, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        exchange_rate_date, exchange_rate_source, value_source, notes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(batch_id, account_id) DO UPDATE SET
         debit_initial = excluded.debit_initial,
         credit_initial = excluded.credit_initial,
@@ -741,6 +740,8 @@ export function saveOpeningBalanceLines(
         currency_amount = excluded.currency_amount,
         exchange_rate = excluded.exchange_rate,
         exchange_rate_date = excluded.exchange_rate_date,
+        exchange_rate_source = excluded.exchange_rate_source,
+        value_source = excluded.value_source,
         notes = excluded.notes,
         updated_at = excluded.updated_at
     `);
@@ -760,6 +761,25 @@ export function saveOpeningBalanceLines(
       const exDate = l.exchange_rate_date || null;
       const note = (l.notes || '').trim();
 
+      const existing = existingByAccount.get(l.account_id);
+
+      // Sursa cursului: dacă nu vine în payload, păstrăm valoarea existentă în DB
+      const payloadRateSource = (l.exchange_rate_source || '').trim();
+      const exRateSource = payloadRateSource || (existing?.exchange_rate_source || '');
+
+      // Sursa valorii: MANUAL doar când linia se modifică efectiv, altfel păstrăm sursa existentă
+      const valuesUnchanged = !!existing
+        && toBani(existing.debit_initial) === dInitBani
+        && toBani(existing.credit_initial) === cInitBani
+        && toBani(existing.debit_prev) === dPrevBani
+        && toBani(existing.credit_prev) === cPrevBani
+        && (existing.currency || 'RON') === curr
+        && toBani(existing.currency_amount || 0) === currAmtBani
+        && (existing.exchange_rate || 1.0) === exRate
+        && (existing.exchange_rate_date || null) === exDate
+        && (existing.notes || '') === note;
+      const valueSource = valuesUnchanged ? existing!.value_source : 'MANUAL';
+
       // Dacă toate valorile sunt zero și nu are monedă străină/note, eliminăm din DB pentru a evita salvarea duplicărilor inutile
       if (dInitBani === 0 && cInitBani === 0 && dPrevBani === 0 && cPrevBani === 0 && curr === 'RON' && currAmtBani === 0 && !note) {
         deleteStmt.run(batchId, l.account_id);
@@ -776,6 +796,8 @@ export function saveOpeningBalanceLines(
           fromBani(currAmtBani),
           exRate,
           exDate,
+          exRateSource,
+          valueSource,
           note,
           now,
           now
@@ -809,7 +831,7 @@ export function saveOpeningBalanceLines(
       batchId,
       userId,
       userName,
-      `Salvat ${data.lines.length} conturi. Tip: ${data.batch_type}, Luna: ${data.start_month}, Versiune: ${nextVersion}`,
+      `Salvat ${data.lines.length} conturi. Tip: ${currentBatch.batch_type}, Luna: ${currentBatch.start_month}, Versiune: ${nextVersion}`,
       now
     );
   });
@@ -827,6 +849,7 @@ export function saveOpeningBalanceLines(
 export function validateOpeningBatch(
   companyId: number,
   batchId: number,
+  version: number,
   userId: number,
   userName: string
 ): { success: boolean; integrity_hash: string; batch: OpeningBatch } {
@@ -835,8 +858,12 @@ export function validateOpeningBatch(
     throw new Error('Lotul de preluare nu există.');
   }
 
-  if (batch.status === 'VALIDATED') {
-    throw new Error('Balanța este deja validată.');
+  if (batch.status !== 'IN_VERIFICATION') {
+    throw openingError('Rulați întâi «Verifică balanța».', 'VALIDATION');
+  }
+
+  if (batch.version !== version) {
+    throw openingError(`Conflict de concurență (Optimistic Locking): datele au fost actualizate de un alt utilizator. Reîncărcați ecranul (versiunea curentă: ${batch.version}, versiunea trimisă: ${version}).`, 'CONFLICT');
   }
 
   // 1. Verificare reguli blocante
@@ -903,6 +930,14 @@ export function validateOpeningBatch(
       `Balanță validată cu succes. Hash integritate: ${hash.substring(0, 16)}... Total debit/credit inițial: ${verif.totals.total_debit_initial.toFixed(2)}, Total precedent: ${verif.totals.total_debit_prev.toFixed(2)}`,
       now
     );
+
+    // Starea de preluare a firmei devine VALIDATED
+    db.prepare(`
+      UPDATE companies SET
+        opening_status = 'VALIDATED',
+        opening_validated_at = ?
+      WHERE id = ?
+    `).run(now, companyId);
   });
 
   tx();
@@ -914,6 +949,26 @@ export function validateOpeningBatch(
 // =========================================================================
 // 6. DEVALIDARE / CORECTARE BALANȚĂ DE PORNIRE
 // =========================================================================
+
+/**
+ * Numără operațiunile contabile din exercițiul curent sau ulterior.
+ * Tabela de articole contabile poate să nu existe încă în schemă.
+ */
+export function countSubsequentOperations(companyId: number, fiscalYear: number): number {
+  const table = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'accounting_entries'`)
+    .get() as { name: string } | undefined;
+  if (!table) {
+    return 0;
+  }
+
+  const row = db.prepare(`
+    SELECT COUNT(*) AS cnt FROM accounting_entries
+    WHERE company_id = ? AND CAST(strftime('%Y', entry_date) AS INTEGER) >= ?
+  `).get(companyId, fiscalYear) as { cnt: number } | undefined;
+
+  return row ? row.cnt : 0;
+}
 
 export function invalidateOpeningBatch(
   companyId: number,
@@ -936,12 +991,20 @@ export function invalidateOpeningBatch(
     throw new Error('Motivul devalidării este obligatoriu și trebuie să aibă minim 5 caractere.');
   }
 
+  // Autorizare: administrator global sau administrator al firmei
+  const isAdmin = db.prepare(`
+    SELECT 1 FROM users WHERE id = ? AND role = 'ADMIN'
+    UNION
+    SELECT 1 FROM user_company_access WHERE user_id = ? AND company_id = ? AND role = 'ADMIN'
+    LIMIT 1
+  `).get(userId, userId, companyId);
+  if (!isAdmin) {
+    throw openingError('Nu aveți dreptul de a devalida balanța.', 'FORBIDDEN');
+  }
+
   // Verificare dacă există operațiuni contabile ulterioare (note contabile închise, jurnale etc.)
-  // În etapele următoare se va interoga tabela de articole contabile (ex: accounting_journal_entries)
-  // Pregătim verificarea:
-  const subsequentOperationsCount = 0; // Se va conecta în Etapa 5/6
-  if (subsequentOperationsCount > 0) {
-    throw new Error('Există operațiuni contabile ulterioare. Corectarea balanței necesită un flux contabil controlat.');
+  if (countSubsequentOperations(companyId, batch.fiscal_year) > 0) {
+    throw openingError('Există operațiuni contabile ulterioare. Corectarea balanței necesită un flux contabil controlat.', 'SUBSEQUENT_OPERATIONS');
   }
 
   const now = new Date().toISOString();
@@ -959,6 +1022,14 @@ export function invalidateOpeningBatch(
       WHERE id = ?
     `).run(nextVersion, now, batchId);
 
+    // Starea de preluare a firmei revine în DRAFT
+    db.prepare(`
+      UPDATE companies SET
+        opening_status = 'DRAFT',
+        opening_validated_at = NULL
+      WHERE id = ?
+    `).run(companyId);
+
     db.prepare(`
       INSERT INTO accounting_opening_validation_logs (
         batch_id, action, user_id, user_name, reason, details, created_at
@@ -968,7 +1039,7 @@ export function invalidateOpeningBatch(
       userId,
       userName,
       cleanReason,
-      `Balanța a revenit în starea Ciornă (Versiunea: ${nextVersion}). Amprenta anterioară a fost invalidată.`,
+      `Balanța a revenit în starea Ciornă (Versiunea: ${nextVersion}). Amprenta anterioară (${batch.integrity_hash || 'N/A'}) a fost invalidată.`,
       now
     );
   });
