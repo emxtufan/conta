@@ -3,6 +3,18 @@ import { db } from './db';
 import { fromBani, parseAmount, toBani } from './money';
 
 // =========================================================================
+// HELPER PENTRU ERORI CU COD (CONFLICT / SUBSEQUENT_OPERATIONS / FORBIDDEN / VALIDATION)
+// =========================================================================
+
+export type OpeningErrorCode = 'CONFLICT' | 'SUBSEQUENT_OPERATIONS' | 'FORBIDDEN' | 'VALIDATION';
+
+function openingError(message: string, code: OpeningErrorCode = 'VALIDATION'): Error {
+  const err = new Error(message) as Error & { code: OpeningErrorCode };
+  err.code = code;
+  return err;
+}
+
+// =========================================================================
 // TIPURI ȘI INTERFEȚE PRELUARE DATE CONTABILE
 // =========================================================================
 
@@ -16,6 +28,8 @@ export interface OpeningBatch {
   start_month: number;
   batch_type: BatchType;
   status: BatchStatus;
+  setup_completed: number;
+  base_currency: string;
   total_debit_initial: number;
   total_credit_initial: number;
   total_debit_prev: number;
@@ -145,13 +159,18 @@ export function getOrCreateOpeningBatch(
 
   if (!batch) {
     const now = new Date().toISOString();
+    const company = db.prepare('SELECT currency FROM companies WHERE id = ?').get(companyId) as
+      | { currency: string | null }
+      | undefined;
+    const baseCurrency = (company && company.currency ? String(company.currency).trim() : '') || 'RON';
+
     const result = db.prepare(`
       INSERT INTO accounting_opening_batches (
-        company_id, fiscal_year, start_month, batch_type, status,
+        company_id, fiscal_year, start_month, batch_type, status, base_currency,
         total_debit_initial, total_credit_initial, total_debit_prev, total_credit_prev,
         notes, version, created_at, updated_at
-      ) VALUES (?, ?, ?, 'NO_ACTIVITY', 'DRAFT', 0.0, 0.0, 0.0, 0.0, '', 1, ?, ?)
-    `).run(companyId, fiscalYear, startMonth, now, now);
+      ) VALUES (?, ?, ?, 'NO_ACTIVITY', 'DRAFT', ?, 0.0, 0.0, 0.0, 0.0, '', 1, ?, ?)
+    `).run(companyId, fiscalYear, startMonth, baseCurrency, now, now);
 
     const batchId = Number(result.lastInsertRowid);
 
@@ -168,6 +187,115 @@ export function getOrCreateOpeningBatch(
   }
 
   return batch;
+}
+
+/**
+ * Configurarea tipului de preluare (pas obligatoriu înainte de introducerea soldurilor).
+ * Stabilește tipul preluării, luna de start, marchează lotul ca pregătit și resetează
+ * ciclul de verificare/validare (status DRAFT, versiune incrementată).
+ */
+export function setupOpeningBatch(
+  companyId: number,
+  data: {
+    fiscal_year: number;
+    start_month: number;
+    batch_type: BatchType;
+    version: number;
+  },
+  userId: number,
+  userName: string
+): { success: boolean; batch: OpeningBatch } {
+  if (!data.batch_type || !['NO_ACTIVITY', 'YEAR_START', 'DURING_YEAR'].includes(data.batch_type)) {
+    throw openingError('Tipul preluării este invalid.');
+  }
+
+  const startMonth = Number(data.start_month);
+  if (!Number.isInteger(startMonth) || startMonth < 1 || startMonth > 12) {
+    throw openingError('Luna de start trebuie să fie între 1 și 12.');
+  }
+
+  if (data.batch_type === 'YEAR_START' && startMonth !== 1) {
+    throw openingError('Preluarea la început de an pornește din ianuarie.');
+  }
+
+  if (data.batch_type === 'DURING_YEAR' && (startMonth < 2 || startMonth > 12)) {
+    throw openingError('Preluarea în cursul anului pornește dintr-o lună între 2 și 12.');
+  }
+
+  let batch = db
+    .prepare('SELECT * FROM accounting_opening_batches WHERE company_id = ? AND fiscal_year = ?')
+    .get(companyId, data.fiscal_year) as OpeningBatch | undefined;
+
+  if (!batch) {
+    batch = getOrCreateOpeningBatch(companyId, data.fiscal_year, startMonth, userId, userName);
+  }
+
+  if (batch.status === 'VALIDATED') {
+    throw openingError(
+      'Balanța de pornire este validată și blocată. Pentru modificări este necesară o operațiune de devalidare documentată.',
+      'CONFLICT'
+    );
+  }
+
+  if (batch.version !== data.version) {
+    throw openingError(
+      `Conflict de concurență (Optimistic Locking): datele au fost actualizate de un alt utilizator. Reîncărcați ecranul (versiunea curentă: ${batch.version}, versiunea trimisă: ${data.version}).`,
+      'CONFLICT'
+    );
+  }
+
+  if (data.batch_type === 'NO_ACTIVITY') {
+    const existingLines = db.prepare(`
+      SELECT COUNT(*) AS cnt FROM accounting_opening_balance_lines
+      WHERE batch_id = ? AND (
+        debit_initial <> 0 OR credit_initial <> 0 OR debit_prev <> 0 OR credit_prev <> 0 OR currency_amount <> 0
+      )
+    `).get(batch.id) as { cnt: number };
+
+    if (existingLines && existingLines.cnt > 0) {
+      throw openingError(
+        'Există solduri introduse. Ștergeți-le înainte de a alege «fără activitate anterioară».'
+      );
+    }
+  }
+
+  const now = new Date().toISOString();
+  const nextVersion = batch.version + 1;
+
+  const tx = db.transaction(() => {
+    db.prepare(`
+      UPDATE accounting_opening_batches SET
+        batch_type = ?,
+        start_month = ?,
+        status = 'DRAFT',
+        setup_completed = 1,
+        version = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(data.batch_type, startMonth, nextVersion, now, batch!.id);
+
+    db.prepare(`UPDATE companies SET opening_status = 'DRAFT' WHERE id = ?`).run(companyId);
+
+    db.prepare(`
+      INSERT INTO accounting_opening_validation_logs (
+        batch_id, action, user_id, user_name, reason, details, created_at
+      ) VALUES (?, 'SETUP', ?, ?, 'Configurare tip preluare balanță de pornire', ?, ?)
+    `).run(
+      batch!.id,
+      userId,
+      userName,
+      `Tip preluare: ${data.batch_type}, Luna de start: ${startMonth}, Monedă de bază: ${batch!.base_currency || 'RON'}, Versiune: ${nextVersion}`,
+      now
+    );
+  });
+
+  tx();
+
+  const updatedBatch = db
+    .prepare('SELECT * FROM accounting_opening_batches WHERE id = ?')
+    .get(batch.id) as OpeningBatch;
+
+  return { success: true, batch: updatedBatch };
 }
 
 // =========================================================================
@@ -462,6 +590,61 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
 }
 
 // =========================================================================
+// 3b. MARCARE STARE VERIFICARE (DRAFT <-> IN_VERIFICATION)
+// =========================================================================
+
+/**
+ * Marchează rezultatul rulării «Verifică balanța»: fără erori blocante lotul
+ * trece în IN_VERIFICATION, cu erori revine în DRAFT. Lotul validat nu se modifică.
+ */
+export function markVerificationStatus(
+  companyId: number,
+  batchId: number,
+  hasErrors: boolean,
+  userId: number,
+  userName: string
+): { success: boolean; status: BatchStatus; batch: OpeningBatch } {
+  const batch = db.prepare('SELECT * FROM accounting_opening_batches WHERE id = ?').get(batchId) as OpeningBatch | undefined;
+  if (!batch) {
+    throw openingError('Lotul de preluare nu există.');
+  }
+
+  if (batch.status === 'VALIDATED') {
+    return { success: true, status: batch.status, batch };
+  }
+
+  const verif = verifyOpeningBalance(companyId, batchId);
+  const nextStatus: BatchStatus = hasErrors ? 'DRAFT' : 'IN_VERIFICATION';
+  const now = new Date().toISOString();
+
+  const tx = db.transaction(() => {
+    db.prepare(`
+      UPDATE accounting_opening_batches SET
+        status = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(nextStatus, now, batchId);
+
+    db.prepare(`
+      INSERT INTO accounting_opening_validation_logs (
+        batch_id, action, user_id, user_name, reason, details, created_at
+      ) VALUES (?, 'VERIFY', ?, ?, 'Verificare balanță de pornire', ?, ?)
+    `).run(
+      batchId,
+      userId,
+      userName,
+      `Verificare finalizată: ${verif.errors.length} erori, ${verif.warnings.length} avertizări. Stare lot: ${nextStatus}`,
+      now
+    );
+  });
+
+  tx();
+
+  const updatedBatch = db.prepare('SELECT * FROM accounting_opening_batches WHERE id = ?').get(batchId) as OpeningBatch;
+  return { success: true, status: updatedBatch.status, batch: updatedBatch };
+}
+
+// =========================================================================
 // 4. SALVARE LINII BALANȚĂ CU TRANZACȚIE ȘI OPTIMISTIC LOCKING
 // =========================================================================
 
@@ -484,6 +667,7 @@ export function saveOpeningBalanceLines(
       currency_amount?: number;
       exchange_rate?: number;
       exchange_rate_date?: string | null;
+      exchange_rate_source?: string;
       notes?: string;
     }>;
   },
@@ -492,17 +676,39 @@ export function saveOpeningBalanceLines(
 ): { success: boolean; version: number; batch: OpeningBatch } {
   const currentBatch = db.prepare('SELECT * FROM accounting_opening_batches WHERE id = ?').get(batchId) as OpeningBatch;
   if (!currentBatch) {
-    throw new Error('Lotul de preluare nu a fost găsit.');
+    throw openingError('Lotul de preluare nu a fost găsit.');
+  }
+
+  if (!currentBatch.setup_completed) {
+    throw openingError('Alegeți întâi tipul preluării');
   }
 
   if (currentBatch.status === 'VALIDATED') {
-    throw new Error('Balanța de pornire este validată și blocată. Pentru modificări este necesară o operațiune de devalidare documentată.');
+    throw openingError('Balanța de pornire este validată și blocată. Pentru modificări este necesară o operațiune de devalidare documentată.', 'CONFLICT');
   }
 
   // Optimistic Locking
   if (currentBatch.version !== data.version) {
-    throw new Error(`Conflict de concurență (Optimistic Locking): datele au fost actualizate de un alt utilizator. Reîncărcați ecranul (versiunea curentă: ${currentBatch.version}, versiunea trimisă: ${data.version}).`);
+    throw openingError(`Conflict de concurență (Optimistic Locking): datele au fost actualizate de un alt utilizator. Reîncărcați ecranul (versiunea curentă: ${currentBatch.version}, versiunea trimisă: ${data.version}).`, 'CONFLICT');
   }
+
+  const existingRows = db
+    .prepare('SELECT * FROM accounting_opening_balance_lines WHERE batch_id = ?')
+    .all(batchId) as Array<{
+      account_id: number;
+      debit_initial: number;
+      credit_initial: number;
+      debit_prev: number;
+      credit_prev: number;
+      currency: string;
+      currency_amount: number;
+      exchange_rate: number;
+      exchange_rate_date: string | null;
+      exchange_rate_source: string | null;
+      value_source: string;
+      notes: string;
+    }>;
+  const existingByAccount = new Map(existingRows.map((row) => [row.account_id, row]));
 
   const now = new Date().toISOString();
   const nextVersion = currentBatch.version + 1;
