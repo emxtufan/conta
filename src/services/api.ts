@@ -11,6 +11,7 @@ import {
   CompanyOperationalSettings,
   BranchLocation,
   CompanySettingsHistoryItem,
+  BatchType,
   OpeningBatch,
   OpeningBalanceLine,
   OpeningCounterpartyItem,
@@ -60,7 +61,10 @@ class ApiService {
 
     if (!res.ok) {
       const errorMsg = data?.error || `Eroare server (Cod HTTP ${res.status})`;
-      throw new Error(errorMsg);
+      const error = new Error(errorMsg) as Error & { code?: string; status?: number };
+      error.code = data?.code;
+      error.status = res.status;
+      throw error;
     }
 
     return data as T;
@@ -351,16 +355,37 @@ class ApiService {
   // ========================================================
   // ETAPA 4: PRELUARE DATE CONTABILE (BALANȚA DE PORNIRE)
   // ========================================================
+  async setupOpeningBalance(
+    companyId: number,
+    data: {
+      fiscal_year: number;
+      start_month: number;
+      batch_type: BatchType;
+      version: number;
+    }
+  ): Promise<{
+    batch: OpeningBatch;
+    lines: OpeningBalanceLine[];
+    verification: OpeningVerificationResult;
+  }> {
+    return this.request(`/api/companies/${companyId}/opening-balance/setup`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
   async getOpeningBalance(companyId: number, year?: number): Promise<{
     batch: OpeningBatch;
     lines: OpeningBalanceLine[];
     verification: OpeningVerificationResult;
+    subsequent_operations: number;
   }> {
     const qs = year ? `?year=${year}` : '';
     return this.request<{
       batch: OpeningBatch;
       lines: OpeningBalanceLine[];
       verification: OpeningVerificationResult;
+      subsequent_operations: number;
     }>(`/api/companies/${companyId}/opening-balance${qs}`);
   }
 
@@ -399,21 +424,27 @@ class ApiService {
     });
   }
 
-  async verifyOpeningBalance(companyId: number, batchId: number): Promise<OpeningVerificationResult> {
-    return this.request<OpeningVerificationResult>(`/api/companies/${companyId}/opening-balance/verify`, {
+  async verifyOpeningBalance(companyId: number, batchId: number): Promise<{
+    verification: OpeningVerificationResult;
+    batch: OpeningBatch;
+  }> {
+    return this.request<{
+      verification: OpeningVerificationResult;
+      batch: OpeningBatch;
+    }>(`/api/companies/${companyId}/opening-balance/verify`, {
       method: 'POST',
       body: JSON.stringify({ batch_id: batchId }),
     });
   }
 
-  async validateOpeningBalance(companyId: number, batchId: number): Promise<{
+  async validateOpeningBalance(companyId: number, batchId: number, version: number): Promise<{
     success: boolean;
     integrity_hash: string;
     batch: OpeningBatch;
   }> {
     return this.request(`/api/companies/${companyId}/opening-balance/validate`, {
       method: 'POST',
-      body: JSON.stringify({ batch_id: batchId }),
+      body: JSON.stringify({ batch_id: batchId, version }),
     });
   }
 

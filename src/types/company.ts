@@ -309,6 +309,8 @@ export interface OpeningBatch {
   start_month: number;
   batch_type: BatchType;
   status: BatchStatus;
+  setup_completed: number;
+  base_currency: string;
   total_debit_initial: number;
   total_credit_initial: number;
   total_debit_prev: number;
@@ -343,6 +345,8 @@ export interface OpeningBalanceLine {
   currency_amount: number;
   exchange_rate: number;
   exchange_rate_date: string | null;
+  exchange_rate_source?: string;
+  value_source?: string;
   notes: string;
   is_synthetic_summary?: boolean;
   has_analytics?: boolean;
