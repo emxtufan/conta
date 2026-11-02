@@ -80,6 +80,7 @@ export interface OpeningCounterpartyItem {
   currency: string;
   original_amount: number;
   remaining_amount: number;
+  remaining_amount_ron: number;
   account_id: number;
   account_symbol: string;
   notes: string;
@@ -1166,6 +1167,20 @@ export function getOpeningCounterparties(batchId: number): OpeningCounterpartyIt
   `).all(batchId) as OpeningCounterpartyItem[];
 }
 
+// Prefixele de conturi sintetice acceptate pentru fiecare tip de terț
+const COUNTERPARTY_ACCOUNT_PREFIXES: Record<'CLIENT' | 'SUPPLIER', string[]> = {
+  SUPPLIER: ['401', '403', '404', '408'],
+  CLIENT: ['411', '413', '418'],
+};
+
+// Traduce o violare de unicitate (document duplicat pentru același terț) în eroare de conflict
+function mapCounterpartyUniqueError(err: unknown): Error {
+  if (String((err as Error)?.message || '').includes('UNIQUE')) {
+    return openingError('Documentul există deja pentru acest terț.', 'CONFLICT');
+  }
+  return err as Error;
+}
+
 export function saveOpeningCounterpartyItem(
   companyId: number,
   batchId: number,
@@ -1179,95 +1194,154 @@ export function saveOpeningCounterpartyItem(
     currency?: string;
     original_amount: number;
     remaining_amount: number;
+    /** Echivalentul în moneda de bază, obligatoriu pentru documentele în valută. */
+    remaining_amount_ron?: number;
     account_id: number;
     account_symbol: string;
     notes?: string;
   }
 ): OpeningCounterpartyItem {
   const batch = db.prepare('SELECT * FROM accounting_opening_batches WHERE id = ?').get(batchId) as OpeningBatch;
-  if (!batch) throw new Error('Lotul de preluare nu există.');
-  if (batch.status === 'VALIDATED') throw new Error('Balanța este validată și nu permite adăugarea de documente istorice.');
+  if (!batch) throw openingError('Lotul de preluare nu există.');
+  if (batch.status === 'VALIDATED') {
+    throw openingError('Balanța este validată și nu permite adăugarea de documente istorice.', 'CONFLICT');
+  }
 
   const name = (data.partner_name || '').trim();
   const docNum = (data.doc_number || '').trim();
   const docDate = (data.doc_date || '').trim();
   const origAmt = round2(data.original_amount);
   const remAmt = round2(data.remaining_amount);
-  const curr = data.currency || 'RON';
+  const baseCurrency = String(batch.base_currency || 'RON').trim().toUpperCase();
+  const curr = String(data.currency || baseCurrency).trim().toUpperCase();
 
-  if (!name) throw new Error('Denumirea partenerului este obligatorie.');
-  if (!docNum) throw new Error('Numărul documentului (factură/chitanță) este obligatoriu.');
-  if (!docDate) throw new Error('Data documentului este obligatorie.');
-  if (remAmt <= 0) throw new Error('Suma rămasă neachitată / neîncasată trebuie să fie mai mare decât zero.');
-  if (origAmt < remAmt) throw new Error('Suma originală a facturii nu poate fi mai mică decât suma rămasă.');
+  if (!name) throw openingError('Denumirea partenerului este obligatorie.');
+  if (!docNum) throw openingError('Numărul documentului (factură/chitanță) este obligatoriu.');
+  if (!docDate) throw openingError('Data documentului este obligatorie.');
+
+  const allowedCurrencies = getAllowedCurrencies(companyId);
+  if (!allowedCurrencies.includes(curr)) {
+    throw openingError(`Moneda ${curr} nu este configurată pentru această societate.`);
+  }
+
+  // Echivalentul în moneda de bază: la valută trebuie transmis explicit, la moneda de bază este chiar suma rămasă.
+  let remAmtRon: number;
+  if (curr === baseCurrency) {
+    remAmtRon = remAmt;
+  } else {
+    remAmtRon = round2(Number(data.remaining_amount_ron));
+    if (toBani(remAmtRon) <= 0) {
+      throw openingError(`Suma rămasă în ${baseCurrency} este obligatorie pentru documentele în valută.`);
+    }
+  }
+
+  if (toBani(remAmt) <= 0) throw openingError('Suma rămasă neachitată / neîncasată trebuie să fie mai mare decât zero.');
+  if (toBani(origAmt) < toBani(remAmt)) throw openingError('Suma originală a facturii nu poate fi mai mică decât suma rămasă.');
+
+  // Documentul istoric trebuie să fie anterior datei de început a preluării
+  const startMonthStr = String(batch.start_month).padStart(2, '0');
+  const openingStartDate = `${batch.fiscal_year}-${startMonthStr}-01`;
+  if (docDate >= openingStartDate) {
+    throw openingError('Documentul trebuie să fie anterior datei preluării.');
+  }
 
   // Verificare cont contabil asociat
-  const acc = db.prepare('SELECT id, symbol FROM accounting_accounts WHERE id = ? AND company_id = ?').get(data.account_id, companyId) as any;
-  if (!acc) throw new Error('Contul contabil asociat terțului nu există în această societate.');
+  const acc = db.prepare('SELECT id, symbol FROM accounting_accounts WHERE id = ? AND company_id = ?').get(data.account_id, companyId) as { id: number; symbol: string } | undefined;
+  if (!acc) throw openingError('Contul contabil asociat terțului nu există în această societate.');
+
+  // Tipul de terț trebuie să corespundă prefixului contului contabil
+  const allowedPrefixes = COUNTERPARTY_ACCOUNT_PREFIXES[data.partner_type] || [];
+  if (!allowedPrefixes.some(prefix => acc.symbol.startsWith(prefix))) {
+    throw openingError(`Contul ${acc.symbol} nu corespunde tipului de terț.`);
+  }
+
+  // Conturile cu analitice active nu pot primi direct documente ale terților
+  const activeAnalytics = db.prepare(`
+    SELECT id FROM accounting_accounts
+    WHERE parent_id = ? AND company_id = ? AND is_active = 1
+    LIMIT 1
+  `).get(acc.id, companyId);
+  if (activeAnalytics) {
+    throw openingError('Asociați documentul unui cont analitic.');
+  }
 
   const now = new Date().toISOString();
 
   if (data.id) {
-    db.prepare(`
-      UPDATE accounting_opening_counterparty_items SET
-        partner_type = ?,
-        partner_name = ?,
-        partner_cui = ?,
-        doc_number = ?,
-        doc_date = ?,
-        currency = ?,
-        original_amount = ?,
-        remaining_amount = ?,
-        account_id = ?,
-        account_symbol = ?,
-        notes = ?
-      WHERE id = ? AND batch_id = ?
-    `).run(
-      data.partner_type,
-      name,
-      data.partner_cui ? data.partner_cui.trim() : null,
-      docNum,
-      docDate,
-      curr,
-      origAmt,
-      remAmt,
-      acc.id,
-      acc.symbol,
-      data.notes || '',
-      data.id,
-      batchId
-    );
+    try {
+      db.prepare(`
+        UPDATE accounting_opening_counterparty_items SET
+          partner_type = ?,
+          partner_name = ?,
+          partner_cui = ?,
+          doc_number = ?,
+          doc_date = ?,
+          currency = ?,
+          original_amount = ?,
+          remaining_amount = ?,
+          remaining_amount_ron = ?,
+          account_id = ?,
+          account_symbol = ?,
+          notes = ?
+        WHERE id = ? AND batch_id = ?
+      `).run(
+        data.partner_type,
+        name,
+        data.partner_cui ? data.partner_cui.trim() : null,
+        docNum,
+        docDate,
+        curr,
+        origAmt,
+        remAmt,
+        remAmtRon,
+        acc.id,
+        acc.symbol,
+        data.notes || '',
+        data.id,
+        batchId
+      );
+    } catch (err) {
+      throw mapCounterpartyUniqueError(err);
+    }
     return db.prepare('SELECT * FROM accounting_opening_counterparty_items WHERE id = ?').get(data.id) as OpeningCounterpartyItem;
   } else {
-    const res = db.prepare(`
-      INSERT INTO accounting_opening_counterparty_items (
-        batch_id, partner_type, partner_name, partner_cui, doc_number, doc_date,
-        currency, original_amount, remaining_amount, account_id, account_symbol,
-        notes, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      batchId,
-      data.partner_type,
-      name,
-      data.partner_cui ? data.partner_cui.trim() : null,
-      docNum,
-      docDate,
-      curr,
-      origAmt,
-      remAmt,
-      acc.id,
-      acc.symbol,
-      data.notes || '',
-      now
-    );
+    let res: { lastInsertRowid: number | bigint };
+    try {
+      res = db.prepare(`
+        INSERT INTO accounting_opening_counterparty_items (
+          batch_id, partner_type, partner_name, partner_cui, doc_number, doc_date,
+          currency, original_amount, remaining_amount, remaining_amount_ron, account_id,
+          account_symbol, notes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        batchId,
+        data.partner_type,
+        name,
+        data.partner_cui ? data.partner_cui.trim() : null,
+        docNum,
+        docDate,
+        curr,
+        origAmt,
+        remAmt,
+        remAmtRon,
+        acc.id,
+        acc.symbol,
+        data.notes || '',
+        now
+      );
+    } catch (err) {
+      throw mapCounterpartyUniqueError(err);
+    }
     return db.prepare('SELECT * FROM accounting_opening_counterparty_items WHERE id = ?').get(Number(res.lastInsertRowid)) as OpeningCounterpartyItem;
   }
 }
 
 export function deleteOpeningCounterpartyItem(batchId: number, itemId: number): { success: boolean } {
   const batch = db.prepare('SELECT status FROM accounting_opening_batches WHERE id = ?').get(batchId) as { status: string };
-  if (!batch) throw new Error('Lotul nu există.');
-  if (batch.status === 'VALIDATED') throw new Error('Nu se poate șterge un document dintr-o balanță validată.');
+  if (!batch) throw openingError('Lotul nu există.');
+  if (batch.status === 'VALIDATED') {
+    throw openingError('Nu se poate șterge un document dintr-o balanță validată.', 'CONFLICT');
+  }
 
   db.prepare('DELETE FROM accounting_opening_counterparty_items WHERE id = ? AND batch_id = ?').run(itemId, batchId);
   return { success: true };
