@@ -40,6 +40,7 @@ import {
   getOrCreateOpeningBatch,
   getOpeningBalanceLines,
   saveOpeningBalanceLines,
+  redistributeToAnalytics,
   verifyOpeningBalance,
   validateOpeningBatch,
   invalidateOpeningBatch,
@@ -649,6 +650,37 @@ async function startServer() {
       const verification = verifyOpeningBalance(companyId, result.batch.id);
 
       res.json({ ...result, lines: updatedLines, verification });
+    } catch (err: any) {
+      sendOpeningError(res, err);
+    }
+  });
+
+  app.post('/api/companies/:id/opening-balance/redistribute', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Nu aveți permisiunea de a modifica această societate.' });
+      }
+
+      const { batch_id, parent_account_id, version, allocations } = req.body;
+      const result = redistributeToAnalytics(
+        companyId,
+        batch_id,
+        { parent_account_id, version: Number(version), allocations },
+        req.user!.id,
+        req.user!.full_name
+      );
+
+      const lines = getOpeningBalanceLines(result.batch.id, companyId);
+      const verification = verifyOpeningBalance(companyId, result.batch.id);
+
+      res.json({
+        success: result.success,
+        version: result.batch.version,
+        batch: result.batch,
+        lines,
+        verification
+      });
     } catch (err: any) {
       sendOpeningError(res, err);
     }

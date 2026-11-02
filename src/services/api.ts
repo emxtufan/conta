@@ -426,6 +426,33 @@ class ApiService {
     });
   }
 
+  async redistributeOpeningBalance(
+    companyId: number,
+    batchId: number,
+    data: {
+      parent_account_id: number;
+      version: number;
+      allocations: Array<{
+        account_id: number;
+        debit_initial: number | string;
+        credit_initial: number | string;
+        debit_prev: number | string;
+        credit_prev: number | string;
+      }>;
+    }
+  ): Promise<{
+    success: boolean;
+    version: number;
+    batch: OpeningBatch;
+    lines: OpeningBalanceLine[];
+    verification: OpeningVerificationResult;
+  }> {
+    return this.request(`/api/companies/${companyId}/opening-balance/redistribute`, {
+      method: 'POST',
+      body: JSON.stringify({ batch_id: batchId, ...data }),
+    });
+  }
+
   async verifyOpeningBalance(companyId: number, batchId: number): Promise<{
     verification: OpeningVerificationResult;
     batch: OpeningBatch;

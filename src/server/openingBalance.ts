@@ -990,6 +990,288 @@ export function saveOpeningBalanceLines(
 }
 
 // =========================================================================
+// 4b. REPARTIZARE SOLD PĂRINTE PE CONTURI ANALITICE (REDISTRIBUTE)
+// =========================================================================
+
+/**
+ * Verifică dacă un cont este descendent (direct sau indirect) al unui cont părinte,
+ * urmărind lanțul de parent_id în planul de conturi al societății.
+ */
+function isDescendantAccount(companyId: number, accountId: number, ancestorId: number): boolean {
+  let currentId: number | null = accountId;
+  let guard = 0;
+  while (currentId !== null && guard < 100) {
+    const row = db
+      .prepare('SELECT parent_id FROM accounting_accounts WHERE company_id = ? AND id = ?')
+      .get(companyId, currentId) as { parent_id: number | null } | undefined;
+    if (!row) return false;
+    if (row.parent_id === ancestorId) return true;
+    currentId = row.parent_id;
+    guard++;
+  }
+  return false;
+}
+
+export function redistributeToAnalytics(
+  companyId: number,
+  batchId: number,
+  data: {
+    parent_account_id: number;
+    version: number;
+    allocations: Array<{
+      account_id: number;
+      debit_initial: number | string;
+      credit_initial: number | string;
+      debit_prev: number | string;
+      credit_prev: number | string;
+    }>;
+  },
+  userId: number,
+  userName: string
+): { success: boolean; batch: OpeningBatch } {
+  const batch = db
+    .prepare('SELECT * FROM accounting_opening_batches WHERE id = ? AND company_id = ?')
+    .get(batchId, companyId) as OpeningBatch | undefined;
+
+  if (!batch) {
+    throw openingError('Lotul de preluare nu a fost găsit.');
+  }
+
+  if (batch.status === 'VALIDATED') {
+    throw openingError('Balanța de pornire este validată și blocată. Pentru modificări este necesară o operațiune de devalidare documentată.', 'CONFLICT');
+  }
+
+  // Optimistic Locking
+  if (batch.version !== data.version) {
+    throw openingError(`Conflict de concurență (Optimistic Locking): datele au fost actualizate de un alt utilizator. Reîncărcați ecranul (versiunea curentă: ${batch.version}, versiunea trimisă: ${data.version}).`, 'CONFLICT');
+  }
+
+  const allocations = Array.isArray(data.allocations) ? data.allocations : [];
+  if (allocations.length === 0) {
+    throw openingError('Selectați cel puțin un cont analitic pentru repartizare.');
+  }
+
+  const parentAccount = db
+    .prepare('SELECT * FROM accounting_accounts WHERE company_id = ? AND id = ?')
+    .get(companyId, data.parent_account_id) as { id: number; symbol: string } | undefined;
+
+  if (!parentAccount) {
+    throw openingError('Contul părinte nu a fost găsit în planul de conturi al acestei societăți.');
+  }
+
+  const parentLine = db
+    .prepare('SELECT * FROM accounting_opening_balance_lines WHERE batch_id = ? AND account_id = ?')
+    .get(batchId, parentAccount.id) as any | undefined;
+
+  const parentDebitInitBani = parentLine ? toBani(parentLine.debit_initial) : 0;
+  const parentCreditInitBani = parentLine ? toBani(parentLine.credit_initial) : 0;
+  const parentDebitPrevBani = parentLine ? toBani(parentLine.debit_prev) : 0;
+  const parentCreditPrevBani = parentLine ? toBani(parentLine.credit_prev) : 0;
+
+  if (
+    !parentLine ||
+    (parentDebitInitBani === 0 && parentCreditInitBani === 0 && parentDebitPrevBani === 0 && parentCreditPrevBani === 0)
+  ) {
+    throw openingError(`Contul ${parentAccount.symbol} nu are sold propriu de repartizat.`);
+  }
+
+  // 1. Validarea fiecărei alocări
+  const seenAccountIds = new Set<number>();
+  const prepared: Array<{
+    account_id: number;
+    account_symbol: string;
+    debit_initial: number;
+    credit_initial: number;
+    debit_prev: number;
+    credit_prev: number;
+  }> = [];
+
+  for (const allocation of allocations) {
+    const accountId = Number(allocation.account_id);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      throw openingError('Lista de repartizare conține un cont invalid.');
+    }
+
+    const account = db
+      .prepare('SELECT * FROM accounting_accounts WHERE company_id = ? AND id = ?')
+      .get(companyId, accountId) as { id: number; symbol: string; is_active: number } | undefined;
+
+    if (!account) {
+      throw openingError(`Contul analitic #${accountId} nu a fost găsit în planul de conturi al acestei societăți.`);
+    }
+
+    if (account.is_active !== 1) {
+      throw openingError(`Analiticul ${account.symbol} este inactiv.`);
+    }
+
+    if (seenAccountIds.has(account.id)) {
+      throw openingError(`Analiticul ${account.symbol} apare de mai multe ori în lista de repartizare.`);
+    }
+    seenAccountIds.add(account.id);
+
+    if (!isDescendantAccount(companyId, account.id, parentAccount.id)) {
+      throw openingError(`Contul ${account.symbol} nu este analitic (direct sau indirect) al contului ${parentAccount.symbol}.`);
+    }
+
+    const children = db
+      .prepare('SELECT COUNT(*) as total FROM accounting_accounts WHERE company_id = ? AND parent_id = ?')
+      .get(companyId, account.id) as { total: number } | undefined;
+    if (children && children.total > 0) {
+      throw openingError(`Analiticul ${account.symbol} are analitice proprii și nu poate primi sold direct.`);
+    }
+
+    const existingLine = db
+      .prepare('SELECT * FROM accounting_opening_balance_lines WHERE batch_id = ? AND account_id = ?')
+      .get(batchId, account.id) as any | undefined;
+
+    if (
+      existingLine &&
+      (toBani(existingLine.debit_initial) !== 0 ||
+        toBani(existingLine.credit_initial) !== 0 ||
+        toBani(existingLine.debit_prev) !== 0 ||
+        toBani(existingLine.credit_prev) !== 0)
+    ) {
+      throw openingError(`Analiticul ${account.symbol} are deja solduri introduse.`);
+    }
+
+    const debitInitBani = toBani(allocation.debit_initial);
+    const creditInitBani = toBani(allocation.credit_initial);
+    const debitPrevBani = toBani(allocation.debit_prev);
+    const creditPrevBani = toBani(allocation.credit_prev);
+
+    if (debitInitBani < 0 || creditInitBani < 0 || debitPrevBani < 0 || creditPrevBani < 0) {
+      throw openingError(`Analiticul ${account.symbol} are valori negative. Repartizarea acceptă doar sume pozitive.`);
+    }
+
+    prepared.push({
+      account_id: account.id,
+      account_symbol: account.symbol,
+      debit_initial: debitInitBani,
+      credit_initial: creditInitBani,
+      debit_prev: debitPrevBani,
+      credit_prev: creditPrevBani,
+    });
+  }
+
+  // 2. Conservarea totalurilor părintelui pe fiecare coloană
+  const columns: Array<{
+    key: 'debit_initial' | 'credit_initial' | 'debit_prev' | 'credit_prev';
+    label: string;
+    parentBani: number;
+  }> = [
+    { key: 'debit_initial', label: 'debit inițial', parentBani: parentDebitInitBani },
+    { key: 'credit_initial', label: 'credit inițial', parentBani: parentCreditInitBani },
+    { key: 'debit_prev', label: 'debit precedent', parentBani: parentDebitPrevBani },
+    { key: 'credit_prev', label: 'credit precedent', parentBani: parentCreditPrevBani },
+  ];
+
+  for (const column of columns) {
+    const totalBani = prepared.reduce((sum, line) => sum + line[column.key], 0);
+    if (totalBani !== column.parentBani) {
+      throw openingError(
+        `Repartizarea nu conservă totalul contului ${parentAccount.symbol}: ${column.label} ${fromBani(totalBani)} ≠ ${fromBani(column.parentBani)}.`
+      );
+    }
+  }
+
+  const now = new Date().toISOString();
+  const nextVersion = batch.version + 1;
+
+  // Valuta se preia de la părinte doar când repartizarea are o singură alocare
+  const singleAllocation = prepared.length === 1;
+  const currency = singleAllocation ? (parentLine.currency || 'RON') : 'RON';
+  const currencyAmountBani = singleAllocation ? toBani(parentLine.currency_amount) : 0;
+  const exchangeRate = singleAllocation ? (parentLine.exchange_rate || 1.0) : 1.0;
+  const exchangeRateDate = singleAllocation ? (parentLine.exchange_rate_date || null) : null;
+  const exchangeRateSource = singleAllocation ? (parentLine.exchange_rate_source || '') : '';
+
+  const details = JSON.stringify({
+    parent: { account_id: parentAccount.id, account_symbol: parentAccount.symbol },
+    allocations: prepared.map((line) => ({
+      account_id: line.account_id,
+      account_symbol: line.account_symbol,
+      debit_initial: fromBani(line.debit_initial),
+      credit_initial: fromBani(line.credit_initial),
+      debit_prev: fromBani(line.debit_prev),
+      credit_prev: fromBani(line.credit_prev),
+    })),
+  });
+
+  const tx = db.transaction(() => {
+    const upsertStmt = db.prepare(`
+      INSERT INTO accounting_opening_balance_lines (
+        batch_id, account_id, account_symbol, debit_initial, credit_initial,
+        debit_prev, credit_prev, currency, currency_amount, exchange_rate,
+        exchange_rate_date, exchange_rate_source, value_source, notes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', '', ?, ?)
+      ON CONFLICT(batch_id, account_id) DO UPDATE SET
+        account_symbol = excluded.account_symbol,
+        debit_initial = excluded.debit_initial,
+        credit_initial = excluded.credit_initial,
+        debit_prev = excluded.debit_prev,
+        credit_prev = excluded.credit_prev,
+        currency = excluded.currency,
+        currency_amount = excluded.currency_amount,
+        exchange_rate = excluded.exchange_rate,
+        exchange_rate_date = excluded.exchange_rate_date,
+        exchange_rate_source = excluded.exchange_rate_source,
+        value_source = excluded.value_source,
+        updated_at = excluded.updated_at
+    `);
+
+    for (const line of prepared) {
+      upsertStmt.run(
+        batchId,
+        line.account_id,
+        line.account_symbol,
+        fromBani(line.debit_initial),
+        fromBani(line.credit_initial),
+        fromBani(line.debit_prev),
+        fromBani(line.credit_prev),
+        currency,
+        fromBani(currencyAmountBani),
+        exchangeRate,
+        exchangeRateDate,
+        exchangeRateSource,
+        now,
+        now
+      );
+    }
+
+    // Linia părintelui dispare: soldul propriu migrează integral pe analitice
+    db.prepare('DELETE FROM accounting_opening_balance_lines WHERE batch_id = ? AND account_id = ?').run(
+      batchId,
+      parentAccount.id
+    );
+
+    db.prepare(`
+      UPDATE accounting_opening_batches SET
+        status = 'DRAFT',
+        version = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(nextVersion, now, batchId);
+
+    db.prepare(`
+      INSERT INTO accounting_opening_validation_logs (
+        batch_id, action, user_id, user_name, reason, details, created_at
+      ) VALUES (?, 'REDISTRIBUTE', ?, ?, 'Repartizare sold pe conturi analitice', ?, ?)
+    `).run(
+      batchId,
+      userId,
+      userName,
+      details,
+      now
+    );
+  });
+
+  tx();
+
+  const updatedBatch = db.prepare('SELECT * FROM accounting_opening_batches WHERE id = ?').get(batchId) as OpeningBatch;
+  return { success: true, batch: updatedBatch };
+}
+
+// =========================================================================
 // 5. VALIDARE BALANȚĂ DE PORNIRE (LOCK ȘI AMPRENTĂ DE INTEGRITATE)
 // =========================================================================
 
