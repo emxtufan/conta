@@ -72,6 +72,52 @@ class ApiService {
     return data as T;
   }
 
+  private async downloadFile(endpoint: string, fallbackName: string): Promise<void> {
+    const headers: Record<string, string> = {};
+
+    if (this.token) {
+      headers['Authorization'] = `Bearer ${this.token}`;
+    }
+
+    const res = await fetch(endpoint, { headers });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => null);
+      const errorMsg = data?.error || `Eroare server (Cod HTTP ${res.status})`;
+      const error = new Error(errorMsg) as Error & { code?: string; status?: number };
+      error.code = data?.code;
+      error.status = res.status;
+      throw error;
+    }
+
+    const blob = await res.blob();
+
+    const disposition = res.headers.get('Content-Disposition') || '';
+    let fileName = fallbackName;
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+      try {
+        fileName = decodeURIComponent(utf8Match[1].trim());
+      } catch {
+        fileName = utf8Match[1].trim();
+      }
+    } else {
+      const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+      if (plainMatch) {
+        fileName = plainMatch[1].trim();
+      }
+    }
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
+
   // Auth
   async login(email: string, password: string): Promise<{ token: string; user: User }> {
     const res = await this.request<{ token: string; user: User }>('/api/auth/login', {
@@ -599,6 +645,24 @@ class ApiService {
   async getOpeningValidationLogs(companyId: number, batchId: number): Promise<OpeningValidationLog[]> {
     return this.request<OpeningValidationLog[]>(
       `/api/companies/${companyId}/opening-balance/logs?batchId=${batchId}`
+    );
+  }
+
+  async downloadOpeningExport(
+    companyId: number,
+    batchId: number,
+    format: 'csv' | 'xlsx'
+  ): Promise<void> {
+    return this.downloadFile(
+      `/api/companies/${companyId}/opening-balance/export?batch_id=${batchId}&format=${format}`,
+      `balanta-inceput-${batchId}.${format}`
+    );
+  }
+
+  async downloadOpeningTemplate(companyId: number): Promise<void> {
+    return this.downloadFile(
+      `/api/companies/${companyId}/opening-balance/import/template`,
+      'model-import-balanta-inceput.xlsx'
     );
   }
 }
