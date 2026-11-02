@@ -350,6 +350,12 @@ export interface OpeningBalanceLine {
   notes: string;
   is_synthetic_summary?: boolean;
   has_analytics?: boolean;
+  own_values?: {
+    debit_initial: number;
+    credit_initial: number;
+    debit_prev: number;
+    credit_prev: number;
+  } | null;
 }
 
 export interface OpeningCounterpartyItem {

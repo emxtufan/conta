@@ -67,6 +67,12 @@ export interface OpeningBalanceLine {
   notes: string;
   is_synthetic_summary?: boolean;
   has_analytics?: boolean;
+  own_values?: {
+    debit_initial: number;
+    credit_initial: number;
+    debit_prev: number;
+    credit_prev: number;
+  } | null;
 }
 
 export interface OpeningCounterpartyItem {
@@ -401,6 +407,7 @@ export function getOpeningBalanceLines(batchId: number, companyId: number): Open
       notes: saved ? saved.notes : '',
       is_synthetic_summary: false,
       has_analytics: false,
+      own_values: null,
     };
   });
 
@@ -429,6 +436,24 @@ export function getOpeningBalanceLines(batchId: number, companyId: number): Open
       if (hasChildValues) {
         // În acest caz, contul sintetic acționează ca totalizator agregat
         line.is_synthetic_summary = true;
+
+        // Valorile proprii salvate pe sintetic se pierd la agregare; le păstrăm
+        // separat pentru a putea semnala dubla preluare (direct + pe analitice).
+        const ownDebitInitialBani = toBani(line.debit_initial);
+        const ownCreditInitialBani = toBani(line.credit_initial);
+        const ownDebitPrevBani = toBani(line.debit_prev);
+        const ownCreditPrevBani = toBani(line.credit_prev);
+        const hasOwnValues = ownDebitInitialBani !== 0 || ownCreditInitialBani !== 0
+          || ownDebitPrevBani !== 0 || ownCreditPrevBani !== 0;
+        line.own_values = hasOwnValues
+          ? {
+              debit_initial: fromBani(ownDebitInitialBani),
+              credit_initial: fromBani(ownCreditInitialBani),
+              debit_prev: fromBani(ownDebitPrevBani),
+              credit_prev: fromBani(ownCreditPrevBani),
+            }
+          : null;
+
         const childDebitInitialBani = children.reduce((sum, c) => sum + toBani(c.debit_initial), 0);
         const childCreditInitialBani = children.reduce((sum, c) => sum + toBani(c.credit_initial), 0);
         const childDebitPrevBani = children.reduce((sum, c) => sum + toBani(c.debit_prev), 0);
@@ -520,6 +545,9 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
 
     // 4. Verificare dublă înregistrare pe cont părinte și analitice
     // Verificăm dacă utilizatorul a introdus sume direct pe un cont părinte care are și analitice cu sume
+    if (line.is_synthetic_summary && line.own_values) {
+      errors.push(`Contul ${line.account_symbol} are solduri introduse atât direct, cât și pe analitice. Ștergeți soldul sintetic (dublă preluare).`);
+    }
     if (line.has_analytics && !line.is_synthetic_summary) {
       // Dacă nu este rezumat calculat automat, verificăm dacă este în baza de date cu valori
       const dbSaved = db.prepare('SELECT * FROM accounting_opening_balance_lines WHERE batch_id = ? AND account_id = ?').get(batchId, line.account_id) as any;
@@ -1777,6 +1805,11 @@ export function getOpeningBalances(
     const creditInitialBani = toBani(l.credit_initial);
     const debitPrevBani = toBani(l.debit_prev);
     const creditPrevBani = toBani(l.credit_prev);
+
+    // Conturile fără nicio valoare introdusă nu intră în snapshot-ul balanței
+    if (debitInitialBani === 0 && creditInitialBani === 0 && debitPrevBani === 0 && creditPrevBani === 0) {
+      continue;
+    }
 
     const diffBani = debitPrevBani - creditPrevBani;
 
