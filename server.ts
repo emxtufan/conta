@@ -630,6 +630,20 @@ async function startServer() {
     }
   });
 
+  app.get('/api/companies/:id/opening-balance/snapshot', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Nu aveți permisiunea de a accesa această societate.' });
+      }
+
+      const year = req.query.year ? parseInt(req.query.year as string, 10) : new Date().getFullYear();
+      res.json(getOpeningBalances(companyId, year));
+    } catch (err: any) {
+      sendOpeningError(res, err);
+    }
+  });
+
   app.put('/api/companies/:id/opening-balance', requireAuth, (req: AuthRequest, res: Response) => {
     try {
       const companyId = parseInt(req.params.id, 10);

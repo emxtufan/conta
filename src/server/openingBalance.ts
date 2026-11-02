@@ -1691,63 +1691,123 @@ export function deleteOpeningCounterpartyItem(batchId: number, itemId: number): 
 // 10. SERVICIU CONTABIL REUTILIZABIL PENTRU MODULELE VIITOARE
 // =========================================================================
 
+/** Valorile unei laturi (debit / credit) exprimate în lei. */
+export interface OpeningBalanceSideTotals {
+  debit: number;
+  credit: number;
+}
+
+/** Un cont frunză din instantaneul soldurilor de deschidere. */
+export interface OpeningBalanceAccountSnapshot {
+  account_id: number;
+  account_symbol: string;
+  account_name: string;
+  account_type: 'SYNTHETIC' | 'ANALYTIC';
+  opening: OpeningBalanceSideTotals;
+  previous_totals: OpeningBalanceSideTotals;
+  previous_turnover: OpeningBalanceSideTotals;
+  balance_at_start: OpeningBalanceSideTotals;
+}
+
+/** Instantaneul soldurilor de deschidere consumat de motoarele contabile. */
+export interface OpeningBalancesSnapshot {
+  is_validated: boolean;
+  batch: OpeningBatch | null;
+  accounts: OpeningBalanceAccountSnapshot[];
+}
+
 /**
- * Oferă datele de deschidere (solduri inițiale și totaluri precedente)
- * necesare motoarelor viitoare de Balanțe, Fișe de cont și Registre.
+ * Oferă instantaneul soldurilor de deschidere (lotul validat și conturile frunză)
+ * necesar motoarelor de Balanțe, Fișe de cont și Registre.
+ *
+ * Valorile se calculează în bani și se convertesc în lei la ieșire: soldul inițial
+ * (opening), totalurile precedente (previous_totals), rulajele precedente
+ * (previous_turnover = totaluri precedente − sold inițial) și soldul la începutul
+ * perioadei (balance_at_start).
+ *
+ * @param companyId societatea pentru care se citește balanța de pornire
+ * @param fiscalYear exercițiul financiar al lotului
+ * @param startPeriod luna de început cerută; trebuie să coincidă cu luna lotului
+ * @throws Error dacă luna cerută diferă de luna lotului sau dacă amprenta de
+ * integritate recalculată nu corespunde celei salvate la validare
  */
 export function getOpeningBalances(
   companyId: number,
   fiscalYear: number,
-  _startPeriod?: number
-): {
-  batch: OpeningBatch | null;
-  isValidated: boolean;
-  balances: Map<string, {
-    account_id: number;
-    account_symbol: string;
-    debit_initial: number;
-    credit_initial: number;
-    debit_prev: number;
-    credit_prev: number;
-    debit_final: number;
-    credit_final: number;
-  }>;
-} {
+  startPeriod?: number
+): OpeningBalancesSnapshot {
   const batch = db.prepare(`
     SELECT * FROM accounting_opening_batches
     WHERE company_id = ? AND fiscal_year = ?
   `).get(companyId, fiscalYear) as OpeningBatch | undefined;
 
-  const resultMap = new Map<string, any>();
-
   if (!batch) {
     return {
+      is_validated: false,
       batch: null,
-      isValidated: false,
-      balances: resultMap
+      accounts: []
     };
   }
 
-  const lines = getOpeningBalanceLines(batch.id, companyId);
-  for (const l of lines) {
-    if (!l.is_synthetic_summary) {
-      resultMap.set(l.account_symbol, {
-        account_id: l.account_id,
-        account_symbol: l.account_symbol,
-        debit_initial: l.debit_initial,
-        credit_initial: l.credit_initial,
-        debit_prev: l.debit_prev,
-        credit_prev: l.credit_prev,
-        debit_final: l.debit_final,
-        credit_final: l.credit_final
-      });
+  if (startPeriod !== undefined && startPeriod !== batch.start_month) {
+    throw openingError(
+      `Perioada de început cerută (${startPeriod}) nu corespunde cu luna de început a lotului de preluare (${batch.start_month}).`
+    );
+  }
+
+  const isValidated = batch.status === 'VALIDATED';
+
+  if (isValidated) {
+    const recalculatedHash = computeOpeningIntegrityHash(batch.id);
+    if (!batch.integrity_hash || recalculatedHash !== batch.integrity_hash) {
+      throw openingError(
+        `Amprenta de integritate a balanței de pornire nu corespunde datelor stocate (luna ${batch.start_month}, exercițiul ${batch.fiscal_year}). Balanța a fost modificată după validare și trebuie reverificată.`,
+        'CONFLICT'
+      );
     }
   }
 
+  const lines = getOpeningBalanceLines(batch.id, companyId);
+  const accounts: OpeningBalanceAccountSnapshot[] = [];
+
+  for (const l of lines) {
+    if (l.is_synthetic_summary) continue;
+
+    const debitInitialBani = toBani(l.debit_initial);
+    const creditInitialBani = toBani(l.credit_initial);
+    const debitPrevBani = toBani(l.debit_prev);
+    const creditPrevBani = toBani(l.credit_prev);
+
+    const diffBani = debitPrevBani - creditPrevBani;
+
+    accounts.push({
+      account_id: l.account_id,
+      account_symbol: l.account_symbol,
+      account_name: l.account_name,
+      account_type: l.account_type,
+      opening: {
+        debit: fromBani(debitInitialBani),
+        credit: fromBani(creditInitialBani)
+      },
+      previous_totals: {
+        debit: fromBani(debitPrevBani),
+        credit: fromBani(creditPrevBani)
+      },
+      previous_turnover: {
+        debit: fromBani(debitPrevBani - debitInitialBani),
+        credit: fromBani(creditPrevBani - creditInitialBani)
+      },
+      balance_at_start: {
+        debit: fromBani(diffBani > 0 ? diffBani : 0),
+        credit: fromBani(diffBani < 0 ? -diffBani : 0)
+      }
+    });
+  }
+
   return {
+    is_validated: isValidated,
     batch,
-    isValidated: batch.status === 'VALIDATED',
-    balances: resultMap
+    accounts
   };
 }
 
