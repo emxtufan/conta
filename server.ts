@@ -50,7 +50,10 @@ import {
   commitOpeningImport,
   copyOpeningBalanceFromCompany,
   getOpeningValidationLogs,
-  getOpeningBalances
+  getOpeningBalances,
+  setupOpeningBatch,
+  markVerificationStatus,
+  countSubsequentOperations
 } from './src/server/openingBalance.js';
 import { validateCUI, validateIBAN, validateRegCom } from './src/server/validators.js';
 import { runAcceptanceTests } from './src/server/tests.js';
@@ -58,6 +61,25 @@ import { db } from './src/server/db.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/**
+ * Răspuns de eroare pentru rutele de balanță de pornire.
+ * Păstrează codul semantic al erorii: CONFLICT / SUBSEQUENT_OPERATIONS -> 409,
+ * FORBIDDEN -> 403, orice altă eroare -> 400.
+ */
+function sendOpeningError(res: Response, err: any) {
+  const code = err && typeof err.code === 'string' ? err.code : null;
+  let status = 400;
+  if (code === 'CONFLICT' || code === 'SUBSEQUENT_OPERATIONS') {
+    status = 409;
+  } else if (code === 'FORBIDDEN') {
+    status = 403;
+  }
+  res.status(status).json({
+    error: err && err.message ? err.message : 'Eroare la procesarea balanței de pornire.',
+    code
+  });
+}
 
 async function startServer() {
   const app = express();
@@ -598,10 +620,11 @@ async function startServer() {
       const batch = getOrCreateOpeningBatch(companyId, year, 1, req.user!.id, req.user!.full_name);
       const lines = getOpeningBalanceLines(batch.id, companyId);
       const verification = verifyOpeningBalance(companyId, batch.id);
+      const subsequent_operations = countSubsequentOperations(companyId, year);
 
-      res.json({ batch, lines, verification });
+      res.json({ batch, lines, verification, subsequent_operations });
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
     }
   });
 
@@ -626,7 +649,36 @@ async function startServer() {
 
       res.json({ ...result, lines: updatedLines, verification });
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
+    }
+  });
+
+  app.post('/api/companies/:id/opening-balance/setup', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Nu aveți permisiunea de a modifica această societate.' });
+      }
+
+      const { fiscal_year, start_month, batch_type, version } = req.body;
+      const result = setupOpeningBatch(
+        companyId,
+        {
+          fiscal_year: parseInt(fiscal_year, 10) || new Date().getFullYear(),
+          start_month: parseInt(start_month, 10) || 1,
+          batch_type,
+          version: Number(version)
+        },
+        req.user!.id,
+        req.user!.full_name
+      );
+
+      const lines = getOpeningBalanceLines(result.batch.id, companyId);
+      const verification = verifyOpeningBalance(companyId, result.batch.id);
+
+      res.json({ batch: result.batch, lines, verification });
+    } catch (err: any) {
+      sendOpeningError(res, err);
     }
   });
 
@@ -639,9 +691,16 @@ async function startServer() {
 
       const { batch_id } = req.body;
       const verification = verifyOpeningBalance(companyId, batch_id);
-      res.json(verification);
+      const marked = markVerificationStatus(
+        companyId,
+        batch_id,
+        verification.errors.length > 0,
+        req.user!.id,
+        req.user!.full_name
+      );
+      res.json({ verification, batch: marked.batch });
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
     }
   });
 
@@ -652,11 +711,17 @@ async function startServer() {
         return res.status(403).json({ error: 'Acces interzis.' });
       }
 
-      const { batch_id } = req.body;
-      const result = validateOpeningBatch(companyId, batch_id, req.user!.id, req.user!.full_name);
+      const { batch_id, version } = req.body;
+      const result = validateOpeningBatch(
+        companyId,
+        batch_id,
+        Number(version),
+        req.user!.id,
+        req.user!.full_name
+      );
       res.json(result);
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
     }
   });
 
@@ -671,7 +736,7 @@ async function startServer() {
       const result = invalidateOpeningBatch(companyId, batch_id, reason, req.user!.id, req.user!.full_name);
       res.json(result);
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
     }
   });
 
