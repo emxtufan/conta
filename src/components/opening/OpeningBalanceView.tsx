@@ -13,6 +13,7 @@ import {
   History,
   Users,
   Info,
+  Copy,
 } from 'lucide-react';
 import { api } from '../../services/api';
 import {
@@ -25,6 +26,10 @@ import {
 import { AnalyticAccountModal } from '../accounting/AnalyticAccountModal';
 import { CurrencyDetailsModal } from './CurrencyDetailsModal';
 import { OpeningImportModal } from './OpeningImportModal';
+import { OpeningCounterpartiesPanel } from './OpeningCounterpartiesPanel';
+import { OpeningHistoryModal } from './OpeningHistoryModal';
+import { RedistributeModal } from './RedistributeModal';
+import { CompanyCopyModal } from './CompanyCopyModal';
 
 // =========================================================================
 // CONSTANTE
@@ -165,6 +170,8 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
   const [showImport, setShowImport] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showCopy, setShowCopy] = useState(false);
+  const [redistributeLine, setRedistributeLine] = useState<OpeningBalanceLine | null>(null);
 
   const [currencyModalLine, setCurrencyModalLine] = useState<OpeningBalanceLine | null>(null);
   const [analyticModal, setAnalyticModal] = useState<{ isOpen: boolean; parentSymbol: string }>({
@@ -380,6 +387,38 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     return AMOUNT_FIELDS.some((field) => amounts[field] !== 0);
   };
 
+  /**
+   * Liniile descendente frunză ale unui cont: se urcă pe `parent_symbol`, iar când
+   * ierarhia nu este disponibilă se recurge la prefixul simbolului.
+   */
+  const descendantLeafLines = (parent: OpeningBalanceLine): OpeningBalanceLine[] => {
+    const bySymbol = new Map<string, OpeningBalanceLine>();
+    lines.forEach((line) => bySymbol.set(line.account_symbol, line));
+
+    const isDescendant = (line: OpeningBalanceLine): boolean => {
+      const visited = new Set<number>();
+      let cursor: OpeningBalanceLine | undefined = line;
+      while (cursor && !visited.has(cursor.account_id)) {
+        visited.add(cursor.account_id);
+        const parentSymbol = cursor.parent_symbol;
+        if (!parentSymbol) break;
+        if (parentSymbol === parent.account_symbol) return true;
+        cursor = bySymbol.get(parentSymbol);
+      }
+      return (
+        line.account_symbol !== parent.account_symbol &&
+        line.account_symbol.startsWith(parent.account_symbol)
+      );
+    };
+
+    return lines.filter((line) => {
+      if (line.account_id === parent.account_id) return false;
+      if (line.is_synthetic_summary === true) return false;
+      if (line.has_analytics === true) return false;
+      return isDescendant(line);
+    });
+  };
+
   const inputValue = (line: OpeningBalanceLine, field: AmountField): string => {
     const edit = editedValues[line.account_id];
     if (edit) return edit[field];
@@ -423,6 +462,33 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
 
   const dirtyIds = Array.from(
     new Set([...Object.keys(editedValues).map((k) => Number(k)), ...Object.keys(currencyEdits).map((k) => Number(k))])
+  );
+
+  // ---------------------------------------------------------------- export fișier
+
+  const handleExport = async (format: 'csv' | 'xlsx') => {
+    if (!companyId || !batch) return;
+    if (dirtyIds.length > 0) {
+      setError(`Salvați întâi modificările: există ${dirtyIds.length} valori nesalvate.`);
+      return;
+    }
+    setShowExport(false);
+    setError(null);
+    try {
+      await api.downloadOpeningExport(companyId, batch.id, format);
+    } catch (err: any) {
+      setError(describeApiError(err));
+    }
+  };
+
+  // ---------------------------------------------------------------- valute disponibile pentru terți
+
+  const currencies = Array.from(
+    new Set(
+      [...(batch ? [batch.base_currency] : []), ...lines.map((line) => line.currency)]
+        .map((code) => String(code ?? '').trim().toUpperCase())
+        .filter((code) => code !== '')
+    )
   );
 
   // ---------------------------------------------------------------- exercițiu fiscal
@@ -593,12 +659,65 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
             Import
           </button>
           <button
-            onClick={() => setShowExport((v) => !v)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+            onClick={() => setShowCopy(true)}
+            disabled={
+              !batch ||
+              batch.batch_type === 'NO_ACTIVITY' ||
+              readOnly ||
+              batch.setup_completed === 0 ||
+              dirtyIds.length > 0
+            }
+            title={
+              !batch
+                ? 'Configurați mai întâi preluarea soldurilor.'
+                : batch.batch_type === 'NO_ACTIVITY'
+                  ? 'Societatea fără activitate nu are solduri de preluare.'
+                  : readOnly
+                    ? 'Preluarea este validată — câmpurile sunt read-only.'
+                    : batch.setup_completed === 0
+                      ? 'Finalizați configurarea preluării înainte de preluarea din altă societate.'
+                      : dirtyIds.length > 0
+                        ? `Salvați cele ${dirtyIds.length} modificări nesalvate înainte de preluare.`
+                        : 'Preluați balanța de pornire din altă societate'
+            }
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
           >
-            <Download className="w-3.5 h-3.5" />
-            Export
+            <Copy className="w-3.5 h-3.5" />
+            Preluare din altă societate
           </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowExport((v) => !v)}
+              disabled={!batch || dirtyIds.length > 0}
+              title={
+                !batch
+                  ? 'Configurați mai întâi preluarea soldurilor.'
+                  : dirtyIds.length > 0
+                    ? 'Salvați întâi modificările'
+                    : 'Exportați soldurile de preluare'
+              }
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export
+            </button>
+            {showExport && batch && (
+              <div className="absolute right-0 mt-1 z-20 w-40 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-lg">
+                <button
+                  onClick={() => void handleExport('csv')}
+                  className="w-full text-left px-3 py-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  CSV
+                </button>
+                <button
+                  onClick={() => void handleExport('xlsx')}
+                  className="w-full text-left px-3 py-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  Excel (XLSX)
+                </button>
+              </div>
+            )}
+          </div>
           <button
             onClick={() => setShowHistory((v) => !v)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
@@ -635,7 +754,12 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
               {batch.status === 'VALIDATED' ? (
                 <button
                   onClick={() => void handleInvalidate()}
-                  disabled={saving}
+                  disabled={saving || subsequentOperations > 0}
+                  title={
+                    subsequentOperations > 0
+                      ? 'Există operațiuni contabile ulterioare. Corectarea balanței necesită un flux contabil controlat.'
+                      : 'Anulați validarea preluării'
+                  }
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/30 disabled:opacity-50"
                 >
                   <ShieldOff className="w-3.5 h-3.5" />
