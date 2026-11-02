@@ -613,7 +613,7 @@ export type FileImportPreview = {
   can_commit: boolean;
 };
 
-export type ImportErrorCode = 'VALIDATION' | 'CONFLICT' | 'CONFIRMATION_REQUIRED';
+export type ImportErrorCode = 'VALIDATION' | 'CONFLICT' | 'CONFIRMATION_REQUIRED' | 'FORBIDDEN';
 
 /** Eroare cu cod, pentru deosebirea erorilor de validare de cele de conflict. */
 export class ImportError extends Error {
