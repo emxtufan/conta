@@ -115,8 +115,6 @@ export interface OpeningVerificationResult {
 export function round2(num: number): number {
   if (isNaN(num) || !isFinite(num)) return 0.0;
   return fromBani(toBani(num));
-  if (isNaN(num) || !isFinite(num)) return 0.0;
-  return Math.round((num + Number.EPSILON) * 100) / 100;
 }
 
 /**
@@ -126,29 +124,8 @@ export function round2(num: number): number {
  * Ex: " 1 234,50 " -> 1234.50
  */
 export function parseRomanianNumber(val: any): number {
-  if (val === null || val === undefined || val === '') return 0.0;
-  if (typeof val === 'number') return isFinite(val) ? round2(val) : 0.0;
-
-  let str = String(val).trim();
-  // Elimină spații normale sau non-breaking
-  str = str.replace(/[\s\u00A0]/g, '');
-
-  // Format românesc: conține punct ca separator de mii și virgulă ca separator zecimal
-  if (str.includes(',') && str.includes('.')) {
-    if (str.lastIndexOf(',') > str.lastIndexOf('.')) {
-      // 1.234,56 -> punct este mii, virgula este zecimal
-      str = str.replace(/\./g, '').replace(',', '.');
-    } else {
-      // 1,234.56 -> virgula este mii, punct este zecimal
-      str = str.replace(/,/g, '');
-    }
-  } else if (str.includes(',')) {
-    // Doar virgulă: 1234,56
-    str = str.replace(',', '.');
-  }
-
-  const parsed = parseFloat(str);
-  return isNaN(parsed) || !isFinite(parsed) ? 0.0 : round2(parsed);
+  const parsed = parseAmount(String(val ?? ''), 'RO');
+  return parsed.ok ? fromBani(parsed.bani) : 0.0;
 }
 
 // =========================================================================
@@ -227,14 +204,15 @@ export function getOpeningBalanceLines(batchId: number, companyId: number): Open
   // 3. Creează lista de linii de bază
   const lines: OpeningBalanceLine[] = accounts.map(acc => {
     const saved = savedMap.get(acc.account_id);
-    const debitInit = saved ? round2(saved.debit_initial) : 0.0;
-    const creditInit = saved ? round2(saved.credit_initial) : 0.0;
-    const debitPrev = saved ? round2(saved.debit_prev) : 0.0;
-    const creditPrev = saved ? round2(saved.credit_prev) : 0.0;
+    const debitInitBani = saved ? toBani(saved.debit_initial) : 0;
+    const creditInitBani = saved ? toBani(saved.credit_initial) : 0;
+    const debitPrevBani = saved ? toBani(saved.debit_prev) : 0;
+    const creditPrevBani = saved ? toBani(saved.credit_prev) : 0;
+    const currencyAmountBani = saved ? toBani(saved.currency_amount) : 0;
 
-    const diff = round2(debitPrev - creditPrev);
-    const debitFinal = diff > 0 ? diff : 0.0;
-    const creditFinal = diff < 0 ? round2(-diff) : 0.0;
+    const diffBani = debitPrevBani - creditPrevBani;
+    const debitFinalBani = diffBani > 0 ? diffBani : 0;
+    const creditFinalBani = diffBani < 0 ? -diffBani : 0;
 
     return {
       id: saved ? saved.id : undefined,
@@ -246,14 +224,14 @@ export function getOpeningBalanceLines(batchId: number, companyId: number): Open
       account_type: acc.account_type,
       parent_id: acc.parent_id,
       parent_symbol: acc.parent_symbol,
-      debit_initial: debitInit,
-      credit_initial: creditInit,
-      debit_prev: debitPrev,
-      credit_prev: creditPrev,
-      debit_final: debitFinal,
-      credit_final: creditFinal,
+      debit_initial: fromBani(debitInitBani),
+      credit_initial: fromBani(creditInitBani),
+      debit_prev: fromBani(debitPrevBani),
+      credit_prev: fromBani(creditPrevBani),
+      debit_final: fromBani(debitFinalBani),
+      credit_final: fromBani(creditFinalBani),
       currency: saved ? saved.currency : 'RON',
-      currency_amount: saved ? round2(saved.currency_amount) : 0.0,
+      currency_amount: fromBani(currencyAmountBani),
       exchange_rate: saved ? saved.exchange_rate : 1.0,
       exchange_rate_date: saved ? saved.exchange_rate_date : null,
       notes: saved ? saved.notes : '',
@@ -287,14 +265,19 @@ export function getOpeningBalanceLines(batchId: number, companyId: number): Open
       if (hasChildValues) {
         // În acest caz, contul sintetic acționează ca totalizator agregat
         line.is_synthetic_summary = true;
-        line.debit_initial = round2(children.reduce((sum, c) => sum + c.debit_initial, 0));
-        line.credit_initial = round2(children.reduce((sum, c) => sum + c.credit_initial, 0));
-        line.debit_prev = round2(children.reduce((sum, c) => sum + c.debit_prev, 0));
-        line.credit_prev = round2(children.reduce((sum, c) => sum + c.credit_prev, 0));
+        const childDebitInitialBani = children.reduce((sum, c) => sum + toBani(c.debit_initial), 0);
+        const childCreditInitialBani = children.reduce((sum, c) => sum + toBani(c.credit_initial), 0);
+        const childDebitPrevBani = children.reduce((sum, c) => sum + toBani(c.debit_prev), 0);
+        const childCreditPrevBani = children.reduce((sum, c) => sum + toBani(c.credit_prev), 0);
 
-        const diff = round2(line.debit_prev - line.credit_prev);
-        line.debit_final = diff > 0 ? diff : 0.0;
-        line.credit_final = diff < 0 ? round2(-diff) : 0.0;
+        line.debit_initial = fromBani(childDebitInitialBani);
+        line.credit_initial = fromBani(childCreditInitialBani);
+        line.debit_prev = fromBani(childDebitPrevBani);
+        line.credit_prev = fromBani(childCreditPrevBani);
+
+        const diffBani = childDebitPrevBani - childCreditPrevBani;
+        line.debit_final = fromBani(diffBani > 0 ? diffBani : 0);
+        line.credit_final = fromBani(diffBani < 0 ? -diffBani : 0);
       }
     }
   }
@@ -318,10 +301,10 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
 
   // Pentru calculul balanței se iau în considerare fie liniile frunză (analitice), fie sinteticele fără analitice.
   // Evităm dubla adunare a sinteticelor agregate!
-  let totalDebitInitial = 0.0;
-  let totalCreditInitial = 0.0;
-  let totalDebitPrev = 0.0;
-  let totalCreditPrev = 0.0;
+  let totalDebitInitialBani = 0;
+  let totalCreditInitialBani = 0;
+  let totalDebitPrevBani = 0;
+  let totalCreditPrevBani = 0;
 
   // Verificări structurale:
   for (const line of lines) {
@@ -332,10 +315,10 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
 
     // 2. Verificare convenție pentru început de an (YEAR_START)
     if (batch.batch_type === 'YEAR_START') {
-      if (Math.abs(line.debit_prev - line.debit_initial) > 0.001) {
+      if (toBani(line.debit_prev) !== toBani(line.debit_initial)) {
         errors.push(`Contul ${line.account_symbol}: La preluarea de început de an, Debit precedent (${line.debit_prev}) trebuie să fie egal cu Debit inițial an (${line.debit_initial}).`);
       }
-      if (Math.abs(line.credit_prev - line.credit_initial) > 0.001) {
+      if (toBani(line.credit_prev) !== toBani(line.credit_initial)) {
         errors.push(`Contul ${line.account_symbol}: La preluarea de început de an, Credit precedent (${line.credit_prev}) trebuie să fie egal cu Credit inițial an (${line.credit_initial}).`);
       }
     }
@@ -343,10 +326,10 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
     // 3. Verificare convenție în cursul anului (DURING_YEAR)
     // Totalurile precedente includ soldurile inițiale conform convenției de import SAGA C
     if (batch.batch_type === 'DURING_YEAR') {
-      if (line.debit_prev < line.debit_initial) {
+      if (toBani(line.debit_prev) < toBani(line.debit_initial)) {
         errors.push(`Contul ${line.account_symbol}: Debit precedent (${line.debit_prev}) nu poate fi mai mic decât Debit inițial an (${line.debit_initial}).`);
       }
-      if (line.credit_prev < line.credit_initial) {
+      if (toBani(line.credit_prev) < toBani(line.credit_initial)) {
         errors.push(`Contul ${line.account_symbol}: Credit precedent (${line.credit_prev}) nu poate fi mai mic decât Credit inițial an (${line.credit_initial}).`);
       }
     }
@@ -365,34 +348,36 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
     // Dacă contul are analitice cu valori, adunăm doar analiticele.
     // Dacă contul sintetic NU are analitice, îl adunăm.
     if (!line.is_synthetic_summary) {
-      totalDebitInitial += line.debit_initial;
-      totalCreditInitial += line.credit_initial;
-      totalDebitPrev += line.debit_prev;
-      totalCreditPrev += line.credit_prev;
+      totalDebitInitialBani += toBani(line.debit_initial);
+      totalCreditInitialBani += toBani(line.credit_initial);
+      totalDebitPrevBani += toBani(line.debit_prev);
+      totalCreditPrevBani += toBani(line.credit_prev);
     }
   }
 
-  totalDebitInitial = round2(totalDebitInitial);
-  totalCreditInitial = round2(totalCreditInitial);
-  totalDebitPrev = round2(totalDebitPrev);
-  totalCreditPrev = round2(totalCreditPrev);
+  const totalDebitInitial = fromBani(totalDebitInitialBani);
+  const totalCreditInitial = fromBani(totalCreditInitialBani);
+  const totalDebitPrev = fromBani(totalDebitPrevBani);
+  const totalCreditPrev = fromBani(totalCreditPrevBani);
 
-  const diffInitial = round2(totalDebitInitial - totalCreditInitial);
-  const diffPrev = round2(totalDebitPrev - totalCreditPrev);
+  const diffInitialBani = totalDebitInitialBani - totalCreditInitialBani;
+  const diffPrevBani = totalDebitPrevBani - totalCreditPrevBani;
+  const diffInitial = fromBani(diffInitialBani);
+  const diffPrev = fromBani(diffPrevBani);
 
   // Verificare egalitate debit-credit inițial an
-  if (Math.abs(diffInitial) > 0.001) {
-    errors.push(`Balanța este dezechilibrată la începutul anului: Total debit inițial (${totalDebitInitial.toFixed(2)}) diferă de Total credit inițial (${totalCreditInitial.toFixed(2)}) cu diferența de ${Math.abs(diffInitial).toFixed(2)} lei.`);
+  if (diffInitialBani !== 0) {
+    errors.push(`Balanța este dezechilibrată la începutul anului: Total debit inițial (${totalDebitInitial.toFixed(2)}) diferă de Total credit inițial (${totalCreditInitial.toFixed(2)}) cu diferența de ${fromBani(Math.abs(diffInitialBani)).toFixed(2)} lei.`);
   }
 
   // Verificare egalitate debit-credit precedent
-  if (Math.abs(diffPrev) > 0.001) {
-    errors.push(`Balanța este dezechilibrată la totaluri precedente: Total debit precedent (${totalDebitPrev.toFixed(2)}) diferă de Total credit precedent (${totalCreditPrev.toFixed(2)}) cu diferența de ${Math.abs(diffPrev).toFixed(2)} lei.`);
+  if (diffPrevBani !== 0) {
+    errors.push(`Balanța este dezechilibrată la totaluri precedente: Total debit precedent (${totalDebitPrev.toFixed(2)}) diferă de Total credit precedent (${totalCreditPrev.toFixed(2)}) cu diferența de ${fromBani(Math.abs(diffPrevBani)).toFixed(2)} lei.`);
   }
 
   // Verificare cazul fără activitate
   if (batch.batch_type === 'NO_ACTIVITY') {
-    if (totalDebitInitial > 0 || totalCreditInitial > 0 || totalDebitPrev > 0 || totalCreditPrev > 0) {
+    if (totalDebitInitialBani > 0 || totalCreditInitialBani > 0 || totalDebitPrevBani > 0 || totalCreditPrevBani > 0) {
       warnings.push('Ați selectat tipul „Societate fără activitate anterioară”, dar există conturi cu solduri introduse. Pentru o societate nouă, balanța de pornire se validează cu solduri zero.');
     }
   }
@@ -405,36 +390,50 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
     GROUP BY partner_type
   `).all(batchId) as any[];
 
-  let supplierTotal = 0.0;
-  let clientTotal = 0.0;
+  let supplierTotalBani = 0;
+  let clientTotalBani = 0;
   for (const cp of counterparties) {
-    if (cp.partner_type === 'SUPPLIER') supplierTotal = round2(cp.total_remaining);
-    if (cp.partner_type === 'CLIENT') clientTotal = round2(cp.total_remaining);
+    if (cp.partner_type === 'SUPPLIER') supplierTotalBani = toBani(cp.total_remaining);
+    if (cp.partner_type === 'CLIENT') clientTotalBani = toBani(cp.total_remaining);
   }
 
   // Căutăm soldul total pe contul 401 (Furnizori) și analiticele sale
   const supplierLines = lines.filter(l => l.account_symbol.startsWith('401'));
-  const supplierTarget = round2(
-    supplierLines.filter(l => !l.is_synthetic_summary).reduce((sum, l) => sum + l.credit_final, 0)
-  );
-  const supplierDiff = round2(supplierTotal - supplierTarget);
+  const supplierTargetBani = supplierLines
+    .filter(l => !l.is_synthetic_summary)
+    .reduce((sum, l) => sum + toBani(l.credit_final), 0);
+  const supplierDiffBani = supplierTotalBani - supplierTargetBani;
 
   // Căutăm soldul total pe contul 4111 (Clienți) și analiticele sale
   const clientLines = lines.filter(l => l.account_symbol.startsWith('4111'));
-  const clientTarget = round2(
-    clientLines.filter(l => !l.is_synthetic_summary).reduce((sum, l) => sum + l.debit_final, 0)
-  );
-  const clientDiff = round2(clientTotal - clientTarget);
+  const clientTargetBani = clientLines
+    .filter(l => !l.is_synthetic_summary)
+    .reduce((sum, l) => sum + toBani(l.debit_final), 0);
+  const clientDiffBani = clientTotalBani - clientTargetBani;
 
-  if (supplierTarget > 0 && Math.abs(supplierDiff) > 0.001) {
+  const supplierTotal = fromBani(supplierTotalBani);
+  const supplierTarget = fromBani(supplierTargetBani);
+  const supplierDiff = fromBani(supplierDiffBani);
+  const clientTotal = fromBani(clientTotalBani);
+  const clientTarget = fromBani(clientTargetBani);
+  const clientDiff = fromBani(clientDiffBani);
+
+  if (supplierTargetBani > 0 && supplierDiffBani !== 0) {
     warnings.push(`Soldul creditor al furnizorilor (401: ${supplierTarget.toFixed(2)} lei) nu este justificat complet de facturile neachitate din submodulul Terți (Total introdus: ${supplierTotal.toFixed(2)} lei, Diferență: ${supplierDiff.toFixed(2)} lei).`);
   }
 
-  if (clientTarget > 0 && Math.abs(clientDiff) > 0.001) {
+  if (clientTargetBani > 0 && clientDiffBani !== 0) {
     warnings.push(`Soldul debitor al clienților (4111: ${clientTarget.toFixed(2)} lei) nu este justificat complet de facturile neîncasate din submodulul Terți (Total introdus: ${clientTotal.toFixed(2)} lei, Diferență: ${clientDiff.toFixed(2)} lei).`);
   }
 
   const isValid = errors.length === 0;
+
+  const totalDebitFinalBani = lines
+    .filter(l => !l.is_synthetic_summary)
+    .reduce((s, l) => s + toBani(l.debit_final), 0);
+  const totalCreditFinalBani = lines
+    .filter(l => !l.is_synthetic_summary)
+    .reduce((s, l) => s + toBani(l.credit_final), 0);
 
   return {
     isValid,
@@ -447,12 +446,9 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
       total_debit_prev: totalDebitPrev,
       total_credit_prev: totalCreditPrev,
       diff_prev: diffPrev,
-      total_debit_final: round2(lines.filter(l => !l.is_synthetic_summary).reduce((s, l) => s + l.debit_final, 0)),
-      total_credit_final: round2(lines.filter(l => !l.is_synthetic_summary).reduce((s, l) => s + l.credit_final, 0)),
-      diff_final: round2(
-        lines.filter(l => !l.is_synthetic_summary).reduce((s, l) => s + l.debit_final, 0) -
-        lines.filter(l => !l.is_synthetic_summary).reduce((s, l) => s + l.credit_final, 0)
-      )
+      total_debit_final: fromBani(totalDebitFinalBani),
+      total_credit_final: fromBani(totalCreditFinalBani),
+      diff_final: fromBani(totalDebitFinalBani - totalCreditFinalBani)
     },
     counterparty_summary: {
       supplier_total: supplierTotal,
@@ -548,30 +544,30 @@ export function saveOpeningBalanceLines(
     `);
 
     for (const l of data.lines) {
-      const dInit = round2(l.debit_initial);
-      const cInit = round2(l.credit_initial);
-      const dPrev = round2(l.debit_prev);
-      const cPrev = round2(l.credit_prev);
+      const dInitBani = toBani(l.debit_initial);
+      const cInitBani = toBani(l.credit_initial);
+      const dPrevBani = toBani(l.debit_prev);
+      const cPrevBani = toBani(l.credit_prev);
       const curr = l.currency || 'RON';
-      const currAmt = round2(l.currency_amount || 0);
+      const currAmtBani = toBani(l.currency_amount || 0);
       const exRate = l.exchange_rate || 1.0;
       const exDate = l.exchange_rate_date || null;
       const note = (l.notes || '').trim();
 
       // Dacă toate valorile sunt zero și nu are monedă străină/note, eliminăm din DB pentru a evita salvarea duplicărilor inutile
-      if (dInit === 0 && cInit === 0 && dPrev === 0 && cPrev === 0 && curr === 'RON' && currAmt === 0 && !note) {
+      if (dInitBani === 0 && cInitBani === 0 && dPrevBani === 0 && cPrevBani === 0 && curr === 'RON' && currAmtBani === 0 && !note) {
         deleteStmt.run(batchId, l.account_id);
       } else {
         upsertStmt.run(
           batchId,
           l.account_id,
           l.account_symbol,
-          dInit,
-          cInit,
-          dPrev,
-          cPrev,
+          fromBani(dInitBani),
+          fromBani(cInitBani),
+          fromBani(dPrevBani),
+          fromBani(cPrevBani),
           curr,
-          currAmt,
+          fromBani(currAmtBani),
           exRate,
           exDate,
           note,
