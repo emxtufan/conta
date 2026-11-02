@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { db } from './db';
+import { fromBani, parseAmount, toBani } from './money';
 
 // =========================================================================
 // TIPURI ȘI INTERFEȚE PRELUARE DATE CONTABILE
@@ -112,6 +113,8 @@ export interface OpeningVerificationResult {
 // =========================================================================
 
 export function round2(num: number): number {
+  if (isNaN(num) || !isFinite(num)) return 0.0;
+  return fromBani(toBani(num));
   if (isNaN(num) || !isFinite(num)) return 0.0;
   return Math.round((num + Number.EPSILON) * 100) / 100;
 }
