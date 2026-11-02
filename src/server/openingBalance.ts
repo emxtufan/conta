@@ -616,48 +616,90 @@ export function verifyOpeningBalance(companyId: number, batchId: number): Openin
   }
 
   // 5. Verificare concordanță solduri terți (submodul Clienți & Furnizori)
-  const counterparties = db.prepare(`
-    SELECT partner_type, SUM(remaining_amount) as total_remaining
+  // Documentele se grupează pe contul contabil pe care au fost introduse, iar soldul
+  // de justificat este soldul liniei de cont, cu semnul specific tipului de terț.
+  const counterpartyRows = db.prepare(`
+    SELECT account_id, account_symbol, partner_type, remaining_amount_ron
     FROM accounting_opening_counterparty_items
     WHERE batch_id = ?
-    GROUP BY partner_type
-  `).all(batchId) as any[];
+  `).all(batchId) as Array<{
+    account_id: number;
+    account_symbol: string;
+    partner_type: 'CLIENT' | 'SUPPLIER';
+    remaining_amount_ron: number;
+  }>;
 
-  let supplierTotalBani = 0;
-  let clientTotalBani = 0;
-  for (const cp of counterparties) {
-    if (cp.partner_type === 'SUPPLIER') supplierTotalBani = toBani(cp.total_remaining);
-    if (cp.partner_type === 'CLIENT') clientTotalBani = toBani(cp.total_remaining);
+  const linesByAccountId = new Map<number, OpeningBalanceLine>();
+  for (const line of lines) {
+    linesByAccountId.set(line.account_id, line);
   }
 
-  // Căutăm soldul total pe contul 401 (Furnizori) și analiticele sale
-  const supplierLines = lines.filter(l => l.account_symbol.startsWith('401'));
-  const supplierTargetBani = supplierLines
-    .filter(l => !l.is_synthetic_summary)
-    .reduce((sum, l) => sum + toBani(l.credit_final), 0);
-  const supplierDiffBani = supplierTotalBani - supplierTargetBani;
+  const itemsByAccountId = new Map<number, { symbol: string; partnerType: 'CLIENT' | 'SUPPLIER'; totalBani: number }>();
+  let supplierTotalBani = 0;
+  let clientTotalBani = 0;
+  for (const row of counterpartyRows) {
+    const rowBani = toBani(row.remaining_amount_ron);
+    const existing = itemsByAccountId.get(row.account_id);
+    if (existing) {
+      existing.totalBani += rowBani;
+    } else {
+      itemsByAccountId.set(row.account_id, {
+        symbol: row.account_symbol,
+        partnerType: row.partner_type,
+        totalBani: rowBani
+      });
+    }
+    if (row.partner_type === 'SUPPLIER') supplierTotalBani += rowBani;
+    if (row.partner_type === 'CLIENT') clientTotalBani += rowBani;
+  }
 
-  // Căutăm soldul total pe contul 4111 (Clienți) și analiticele sale
-  const clientLines = lines.filter(l => l.account_symbol.startsWith('4111'));
-  const clientTargetBani = clientLines
-    .filter(l => !l.is_synthetic_summary)
-    .reduce((sum, l) => sum + toBani(l.debit_final), 0);
-  const clientDiffBani = clientTotalBani - clientTargetBani;
+  // Fiecare cont cu documente trebuie să aibă soldul acoperit exact de suma rămasă pe documente
+  for (const [accountId, accountItems] of itemsByAccountId) {
+    const line = linesByAccountId.get(accountId);
+    const lineSymbol = line ? line.account_symbol : accountItems.symbol;
+    const debitFinalBani = line ? toBani(line.debit_final) : 0;
+    const creditFinalBani = line ? toBani(line.credit_final) : 0;
+    const soldBani = accountItems.partnerType === 'SUPPLIER'
+      ? creditFinalBani - debitFinalBani
+      : debitFinalBani - creditFinalBani;
+
+    if (accountItems.totalBani !== soldBani) {
+      errors.push(`Detaliile pe documente pentru ${lineSymbol} (${fromBani(accountItems.totalBani).toFixed(2)}) diferă de soldul contului (${fromBani(soldBani).toFixed(2)}).`);
+    }
+  }
+
+  // Conturile de terți cu sold, dar fără documente justificative
+  for (const line of lines) {
+    if (line.is_synthetic_summary) continue;
+    const symbol = line.account_symbol;
+    const isSupplierAccount = symbol.startsWith('401');
+    const isClientAccount = symbol.startsWith('4111');
+    if (!isSupplierAccount && !isClientAccount) continue;
+    if (itemsByAccountId.has(line.account_id)) continue;
+
+    const soldBani = isSupplierAccount
+      ? toBani(line.credit_final) - toBani(line.debit_final)
+      : toBani(line.debit_final) - toBani(line.credit_final);
+
+    if (soldBani !== 0) {
+      warnings.push(`Soldul ${symbol} nu este detaliat pe documente.`);
+    }
+  }
+
+  // Totalurile pe tip de terț: suma rămasă pe documente față de soldul conturilor de terți
+  const supplierTargetBani = lines
+    .filter(l => !l.is_synthetic_summary && l.account_symbol.startsWith('401'))
+    .reduce((sum, l) => sum + toBani(l.credit_final) - toBani(l.debit_final), 0);
+  const clientTargetBani = lines
+    .filter(l => !l.is_synthetic_summary && l.account_symbol.startsWith('4111'))
+    .reduce((sum, l) => sum + toBani(l.debit_final) - toBani(l.credit_final), 0);
 
   const supplierTotal = fromBani(supplierTotalBani);
   const supplierTarget = fromBani(supplierTargetBani);
-  const supplierDiff = fromBani(supplierDiffBani);
+  const supplierDiff = fromBani(supplierTotalBani - supplierTargetBani);
   const clientTotal = fromBani(clientTotalBani);
   const clientTarget = fromBani(clientTargetBani);
-  const clientDiff = fromBani(clientDiffBani);
-
-  if (supplierTargetBani > 0 && supplierDiffBani !== 0) {
-    warnings.push(`Soldul creditor al furnizorilor (401: ${supplierTarget.toFixed(2)} lei) nu este justificat complet de facturile neachitate din submodulul Terți (Total introdus: ${supplierTotal.toFixed(2)} lei, Diferență: ${supplierDiff.toFixed(2)} lei).`);
-  }
-
-  if (clientTargetBani > 0 && clientDiffBani !== 0) {
-    warnings.push(`Soldul debitor al clienților (4111: ${clientTarget.toFixed(2)} lei) nu este justificat complet de facturile neîncasate din submodulul Terți (Total introdus: ${clientTotal.toFixed(2)} lei, Diferență: ${clientDiff.toFixed(2)} lei).`);
-  }
+  const clientDiff = fromBani(clientTotalBani - clientTargetBani);
 
   const isValid = errors.length === 0;
 

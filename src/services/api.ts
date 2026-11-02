@@ -480,6 +480,7 @@ class ApiService {
       currency?: string;
       original_amount: number;
       remaining_amount: number;
+      remaining_amount_ron?: number;
       account_id: number;
       account_symbol: string;
       notes?: string;
