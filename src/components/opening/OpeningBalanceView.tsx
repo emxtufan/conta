@@ -788,9 +788,17 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
       {batch?.status === 'VALIDATED' && (
         <div className="flex items-start gap-2 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-900/20 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
           <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
-          <span>
-            Balanța de pornire este validată. Societatea este pregătită pentru operare contabilă. Valorile nu mai pot fi
-            modificate direct.
+          <span className="space-y-0.5">
+            <span className="block">
+              Balanța de pornire este validată. Societatea este pregătită pentru operare contabilă. Valorile nu mai pot fi
+              modificate direct.
+            </span>
+            {batch.validated_by_name && (
+              <span className="block text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                Validat de {batch.validated_by_name}
+                {batch.validated_at ? ` la ${new Date(batch.validated_at).toLocaleDateString('ro-RO')}` : ''}
+              </span>
+            )}
           </span>
         </div>
       )}
@@ -968,7 +976,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
                   <Info className="w-10 h-10 text-slate-300 mx-auto" />
                   <h4 className="text-sm font-bold text-slate-700 dark:text-slate-300">Societate fără activitate</h4>
                   <p className="text-xs text-slate-500">
-                    Această preluare nu conține solduri. Puteți valida preluarea pentru a închide perioada.
+                    Societate fără activitate anterioară — balanța de pornire nu conține solduri. Verificați și validați preluarea.
                   </p>
                 </div>
               ) : (
@@ -1010,14 +1018,24 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
                               <span className="flex items-center gap-1.5">
                                 <span className="truncate max-w-[18rem]">{line.account_name}</span>
                                 {deRepartizat && (
-                                  <span
-                                    title="Cont sumar cu valori proprii salvate — soldurile trebuie repartizate pe conturi analitice."
-                                    className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 text-[10px] font-semibold whitespace-nowrap"
-                                  >
-                                    De repartizat
-                                  </span>
+                                  readOnly ? (
+                                    <span
+                                      title="Cont sumar cu valori proprii salvate — soldurile trebuie repartizate pe conturi analitice."
+                                      className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 text-[10px] font-semibold whitespace-nowrap"
+                                    >
+                                      De repartizat
+                                    </span>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setRedistributeLine(line)}
+                                      title="Cont sumar cu valori proprii salvate — soldurile trebuie repartizate pe conturi analitice."
+                                      className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/60 text-[10px] font-semibold whitespace-nowrap transition-colors"
+                                    >
+                                      Repartizează
+                                    </button>
+                                  )
                                 )}
-                                {/* TODO modal: repartizare analitică a conturilor sumar */}
                               </span>
                             </td>
                             {AMOUNT_FIELDS.map((field) => (
