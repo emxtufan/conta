@@ -8,7 +8,12 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const DB_PATH = path.join(DATA_DIR, 'contabilitate.db');
+const DB_PATH = process.env.DB_PATH ? path.resolve(process.env.DB_PATH) : path.join(DATA_DIR, 'contabilitate.db');
+// Directorul părinte al bazei de date poate fi suprascris prin DB_PATH (ex: medii de test)
+const DB_DIR = path.dirname(DB_PATH);
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
 export const db = new Database(DB_PATH);
 
 // Activare mod WAL pentru concurență și blocare rapidă
@@ -18,6 +23,18 @@ db.pragma('foreign_keys = ON');
 export function hashPassword(password: string): string {
   const salt = 'contabilitate_ro_salt_2026';
   return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+}
+
+/**
+ * Adaugă o coloană doar dacă nu există deja (migrație idempotentă pe DB existente).
+ * SQLite nu permite DEFAULT non-constant (CURRENT_TIMESTAMP) la ADD COLUMN,
+ * deci definiția trebuie să folosească doar valori implicite literale.
+ */
+function ensureColumn(table: string, column: string, definition: string): void {
+  const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+  if (!columns.some((col) => col.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 /**
@@ -407,6 +424,29 @@ export function initDatabase() {
       created_at TEXT NOT NULL
     );
 
+    -- Istoric importuri balanță de pornire (trasabilitate fișier/sursă și idempotență)
+    CREATE TABLE IF NOT EXISTS accounting_opening_imports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      batch_id INTEGER NOT NULL REFERENCES accounting_opening_batches(id) ON DELETE CASCADE,
+      fiscal_year INTEGER NOT NULL,
+      source_type TEXT NOT NULL CHECK(source_type IN ('CSV','XLSX','COMPANY_COPY','ROWS')),
+      file_name TEXT DEFAULT '',
+      content_hash TEXT NOT NULL,
+      source_company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+      row_count INTEGER NOT NULL DEFAULT 0,
+      total_debit_initial REAL NOT NULL DEFAULT 0,
+      total_credit_initial REAL NOT NULL DEFAULT 0,
+      total_debit_prev REAL NOT NULL DEFAULT 0,
+      total_credit_prev REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'COMMITTED' CHECK(status IN ('COMMITTED','SUPERSEDED')),
+      user_id INTEGER REFERENCES users(id),
+      user_name TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(batch_id, content_hash)
+    );
+
     -- Indexuri pentru viteză de căutare
     CREATE INDEX IF NOT EXISTS idx_companies_cui ON companies(cui);
     CREATE INDEX IF NOT EXISTS idx_companies_internal_code ON companies(internal_code);
@@ -428,8 +468,49 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_opening_lines_acc ON accounting_opening_balance_lines(account_id);
     CREATE INDEX IF NOT EXISTS idx_opening_counterparty_batch ON accounting_opening_counterparty_items(batch_id);
     CREATE INDEX IF NOT EXISTS idx_opening_logs_batch ON accounting_opening_validation_logs(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_opening_imports_comp ON accounting_opening_imports(company_id, fiscal_year);
   `);
 
+
+  // ========================================================
+  // MIGRAȚII IDEMPOTENTE PENTRU BAZE DE DATE EXISTENTE
+  // ========================================================
+
+  // Loturile de preluare: marcaj configurare finalizată + monedă de bază
+  ensureColumn('accounting_opening_batches', 'setup_completed', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('accounting_opening_batches', 'base_currency', `TEXT NOT NULL DEFAULT 'RON'`);
+
+  // Liniile balanței de pornire: trasabilitate sursă curs/valoare și import
+  // exchange_rate_source: '' | 'BNR' | 'MANUAL' | 'DOCUMENT'
+  ensureColumn('accounting_opening_balance_lines', 'exchange_rate_source', `TEXT DEFAULT ''`);
+  // value_source: 'MANUAL' | 'IMPORT' | 'COPY'
+  ensureColumn('accounting_opening_balance_lines', 'value_source', `TEXT NOT NULL DEFAULT 'MANUAL'`);
+  ensureColumn('accounting_opening_balance_lines', 'source_import_id', 'INTEGER NULL');
+  ensureColumn('accounting_opening_balance_lines', 'created_at', 'TEXT');
+  ensureColumn('accounting_opening_balance_lines', 'updated_at', 'TEXT');
+
+  // Societăți: starea balanței de pornire (NONE | DRAFT | VALIDATED)
+  ensureColumn('companies', 'opening_status', `TEXT NOT NULL DEFAULT 'NONE'`);
+  ensureColumn('companies', 'opening_validated_at', 'TEXT NULL');
+
+  // Solduri terți la preluare: monedă și câmpuri de audit
+  ensureColumn('accounting_opening_counterparty_items', 'currency', `TEXT DEFAULT 'RON'`);
+  ensureColumn('accounting_opening_counterparty_items', 'created_at', 'TEXT');
+  ensureColumn('accounting_opening_counterparty_items', 'updated_at', 'TEXT');
+  ensureColumn('accounting_opening_counterparty_items', 'created_by', 'INTEGER REFERENCES users(id)');
+
+  // Index unic pe documentele de terți; duplicatele istorice nu blochează pornirea aplicației
+  try {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_opening_cp_doc
+        ON accounting_opening_counterparty_items(batch_id, partner_type, partner_name, doc_number, doc_date)
+    `);
+  } catch (error) {
+    console.warn(
+      '[db] Indexul unic ux_opening_cp_doc nu a putut fi creat (există duplicate în datele istorice):',
+      error
+    );
+  }
 
   // Populare utilizator demonstrativ/admin dacă nu există
   const existingUsers = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number };
