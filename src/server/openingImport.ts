@@ -11,7 +11,10 @@
  */
 
 import * as XLSX from 'xlsx';
-import { AmountFormat, parseAmount, toBani } from './money';
+import crypto from 'crypto';
+import { db } from './db';
+import { AmountFormat, fromBani, parseAmount, toBani } from './money';
+import { BatchStatus, BatchType, getAllowedCurrencies } from './openingBalance';
 
 // =========================================================================
 // TIPURI
@@ -548,4 +551,495 @@ export function previewHeaders(rows: ImportCell[][]): ImportHeaderPreview {
   });
 
   return { columns, sample };
+}
+
+// =========================================================================
+// 4. PREVIZUALIZARE IMPORT CU VALIDARE COMPLETĂ
+// =========================================================================
+
+/** Datele primite de la client pentru previzualizarea unui import de fișier. */
+export type FileImportPayload = {
+  batch_id: number;
+  file_name: string;
+  content_base64: string;
+  mapping: ImportMapping;
+  has_header: boolean;
+  number_format: AmountFormat;
+  version?: number;
+  confirm_replace?: boolean;
+  confirm_reimport?: boolean;
+};
+
+export type FileImportRowStatus = 'OK' | 'WARNING' | 'ERROR' | 'SKIPPED';
+
+/** Un rând din previzualizare, cu sumele exprimate în lei. */
+export type FileImportRow = {
+  row_no: number;
+  symbol: string;
+  name: string;
+  account_id: number | null;
+  debit_initial: number;
+  credit_initial: number;
+  debit_prev: number;
+  credit_prev: number;
+  currency: string;
+  currency_amount: number;
+  status: FileImportRowStatus;
+  messages: string[];
+};
+
+/** Importul deja commitat care are aceeași amprentă de conținut. */
+export type FileImportDuplicate = {
+  id: number;
+  created_at: string;
+  user_name: string | null;
+};
+
+export type FileImportPreview = {
+  source_type: ImportSourceType;
+  rows: FileImportRow[];
+  errors: string[];
+  warnings: string[];
+  totals: {
+    debit_initial: number;
+    credit_initial: number;
+    debit_prev: number;
+    credit_prev: number;
+  };
+  is_balanced: boolean;
+  content_hash: string;
+  duplicate_of: FileImportDuplicate | null;
+  existing_lines_count: number;
+  can_commit: boolean;
+};
+
+export type ImportErrorCode = 'VALIDATION' | 'CONFLICT' | 'CONFIRMATION_REQUIRED';
+
+/** Eroare cu cod, pentru deosebirea erorilor de validare de cele de conflict. */
+export class ImportError extends Error {
+  code: ImportErrorCode;
+
+  constructor(message: string, code: ImportErrorCode = 'VALIDATION') {
+    super(message);
+    this.name = 'ImportError';
+    this.code = code;
+  }
+}
+
+/** Lotul de preluare, redus la câmpurile necesare validării importului. */
+type ImportBatchRow = {
+  id: number;
+  company_id: number;
+  batch_type: BatchType;
+  status: BatchStatus;
+  setup_completed: number;
+  base_currency: string;
+};
+
+/** Cont contabil din planul de conturi al societății. */
+type CompanyAccount = {
+  id: number;
+  symbol: string;
+  name: string;
+  is_active: number;
+  parent_id: number | null;
+};
+
+/** Rând în lucru: sumele rămân în bani până la construirea rezultatului. */
+type WorkingImportRow = {
+  row_no: number;
+  symbol: string;
+  name: string;
+  account_id: number | null;
+  account: CompanyAccount | null;
+  debit_initial_bani: number;
+  credit_initial_bani: number;
+  debit_prev_bani: number;
+  credit_prev_bani: number;
+  currency: string;
+  currency_amount_bani: number;
+  errors: string[];
+  warnings: string[];
+  /** Motivul pentru care rândul este ignorat la import, dacă este cazul. */
+  skipped_reason: string | null;
+};
+
+/** Un rând are date dacă are cel puțin o sumă nenulă. */
+function hasNonZeroSums(row: WorkingImportRow): boolean {
+  return (
+    row.debit_initial_bani !== 0 ||
+    row.credit_initial_bani !== 0 ||
+    row.debit_prev_bani !== 0 ||
+    row.credit_prev_bani !== 0 ||
+    row.currency_amount_bani !== 0
+  );
+}
+
+/**
+ * Previzualizează importul unui fișier în balanța de pornire: parsează fișierul,
+ * validează fiecare rând împotriva planului de conturi și a regulilor lotului
+ * (YEAR_START / DURING_YEAR), calculează totalurile în bani, amprenta de conținut
+ * și semnalează eventualele importuri duplicate.
+ */
+export function previewFileImport(companyId: number, payload: FileImportPayload): FileImportPreview {
+  const batch = db.prepare(`
+    SELECT id, company_id, batch_type, status, setup_completed, base_currency
+    FROM accounting_opening_batches
+    WHERE id = ? AND company_id = ?
+  `).get(payload.batch_id, companyId) as ImportBatchRow | undefined;
+
+  if (!batch) {
+    throw new ImportError('Lotul de preluare a balanței nu există.', 'VALIDATION');
+  }
+  if (batch.status === 'VALIDATED') {
+    throw new ImportError('Balanța este validată.', 'CONFLICT');
+  }
+  if (!batch.setup_completed) {
+    throw new ImportError('Alegeți întâi tipul preluării.', 'VALIDATION');
+  }
+  if (batch.batch_type === 'NO_ACTIVITY') {
+    throw new ImportError('Preluarea fără activitate anterioară nu acceptă import de solduri.', 'VALIDATION');
+  }
+
+  // 2. Parsare fișier și mapare coloane
+  const parsed = parseImportFile(payload.file_name, payload.content_base64);
+  const mapped = mapImportRows(parsed.rows, payload.mapping, {
+    has_header: payload.has_header,
+    number_format: payload.number_format
+  });
+
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (mapped.missing_columns.length > 0) {
+    errors.push(`Coloane obligatorii nemapate: ${mapped.missing_columns.join(', ')}`);
+  }
+
+  // 3. Planul de conturi al societății
+  const companyAccounts = db.prepare(`
+    SELECT id, symbol, name, is_active, parent_id
+    FROM accounting_accounts
+    WHERE company_id = ?
+  `).all(companyId) as CompanyAccount[];
+
+  const accountsBySymbol = new Map<string, CompanyAccount>();
+  const childrenByParent = new Map<number, number[]>();
+
+  for (const acc of companyAccounts) {
+    const symbol = acc.symbol.trim();
+    if (!accountsBySymbol.has(symbol)) accountsBySymbol.set(symbol, acc);
+
+    if (acc.parent_id !== null) {
+      const children = childrenByParent.get(acc.parent_id);
+      if (children) children.push(acc.id);
+      else childrenByParent.set(acc.parent_id, [acc.id]);
+    }
+  }
+
+  // Conturile care au analitice active în plan
+  const accountsWithActiveAnalytics = new Set<number>();
+  for (const acc of companyAccounts) {
+    if (acc.parent_id !== null && acc.is_active === 1) {
+      accountsWithActiveAnalytics.add(acc.parent_id);
+    }
+  }
+
+  const baseCurrency = String(batch.base_currency || 'RON').trim().toUpperCase();
+  const allowedCurrencies = getAllowedCurrencies(companyId);
+
+  // 4. Validarea fiecărui rând (toate calculele se fac în bani)
+  const seenSymbols = new Map<string, number>();
+  const working: WorkingImportRow[] = [];
+
+  for (const item of mapped.items) {
+    const rowErrors: string[] = [...item.errors];
+    const rowWarnings: string[] = [];
+
+    const symbol = item.symbol;
+    const account = symbol === '' ? null : accountsBySymbol.get(symbol) ?? null;
+
+    if (symbol !== '') {
+      if (!account) {
+        rowErrors.push(`Contul ${symbol} nu există în planul de conturi.`);
+      } else if (account.is_active !== 1) {
+        rowErrors.push(`Contul ${symbol} este inactiv.`);
+      }
+
+      const firstRowNo = seenSymbols.get(symbol);
+      if (firstRowNo === undefined) {
+        seenSymbols.set(symbol, item.row_no);
+      } else {
+        rowErrors.push(`Cont duplicat (rândurile ${firstRowNo}, ${item.row_no}).`);
+      }
+    }
+
+    if (
+      item.debit_initial_bani < 0 ||
+      item.credit_initial_bani < 0 ||
+      item.debit_prev_bani < 0 ||
+      item.credit_prev_bani < 0
+    ) {
+      rowErrors.push('Valorile nu pot fi negative.');
+    }
+
+    if (batch.batch_type === 'YEAR_START') {
+      if (
+        item.debit_prev_bani !== item.debit_initial_bani ||
+        item.credit_prev_bani !== item.credit_initial_bani
+      ) {
+        rowErrors.push('La început de an, totalurile precedente trebuie să fie egale cu soldurile inițiale.');
+      }
+    } else if (batch.batch_type === 'DURING_YEAR') {
+      if (
+        item.debit_prev_bani < item.debit_initial_bani ||
+        item.credit_prev_bani < item.credit_initial_bani
+      ) {
+        rowErrors.push('Totalul precedent nu poate fi mai mic decât soldul inițial.');
+      }
+    }
+
+    if (!allowedCurrencies.includes(item.currency)) {
+      rowErrors.push(`Moneda ${item.currency} nu este configurată pentru această societate.`);
+    }
+
+    const hasSums =
+      item.debit_initial_bani !== 0 ||
+      item.credit_initial_bani !== 0 ||
+      item.debit_prev_bani !== 0 ||
+      item.credit_prev_bani !== 0;
+
+    if (item.currency !== baseCurrency && hasSums && item.currency_amount_bani === 0) {
+      rowErrors.push('Lipsește suma în valută.');
+    }
+
+    let name = item.name;
+    if (account) {
+      if (name.trim() === '') {
+        name = account.name;
+      } else if (name.trim().toLowerCase() !== account.name.trim().toLowerCase()) {
+        rowWarnings.push(`Denumirea „${name}” diferă de denumirea din planul de conturi („${account.name}”).`);
+      }
+    }
+
+    working.push({
+      row_no: item.row_no,
+      symbol,
+      name,
+      account_id: account ? account.id : null,
+      account,
+      debit_initial_bani: item.debit_initial_bani,
+      credit_initial_bani: item.credit_initial_bani,
+      debit_prev_bani: item.debit_prev_bani,
+      credit_prev_bani: item.credit_prev_bani,
+      currency: item.currency,
+      currency_amount_bani: item.currency_amount_bani,
+      errors: rowErrors,
+      warnings: rowWarnings,
+      skipped_reason: null
+    });
+  }
+
+  // 5. Sintetic și analitic în același fișier
+  const rowsByAccountId = new Map<number, WorkingImportRow>();
+  for (const row of working) {
+    if (row.account_id !== null && !rowsByAccountId.has(row.account_id)) {
+      rowsByAccountId.set(row.account_id, row);
+    }
+  }
+
+  for (const row of working) {
+    const account = row.account;
+    if (!account || !hasNonZeroSums(row)) continue;
+
+    // Toți descendenții contului (prin parent_id), prezenți în fișier cu sume
+    const descendantRows: WorkingImportRow[] = [];
+    const visited = new Set<number>();
+    const stack = [...(childrenByParent.get(account.id) ?? [])];
+
+    while (stack.length > 0) {
+      const childId = stack.pop() as number;
+      if (visited.has(childId)) continue;
+      visited.add(childId);
+
+      const childRow = rowsByAccountId.get(childId);
+      if (childRow && hasNonZeroSums(childRow)) descendantRows.push(childRow);
+
+      for (const grandChildId of childrenByParent.get(childId) ?? []) {
+        stack.push(grandChildId);
+      }
+    }
+
+    if (descendantRows.length === 0) {
+      if (accountsWithActiveAnalytics.has(account.id)) {
+        row.warnings.push(`Contul ${row.symbol} are analitice; soldul trebuie repartizat înainte de validare.`);
+      }
+      continue;
+    }
+
+    // Frunzele din fișier: descendenții care nu au la rândul lor descendenți în fișier
+    const fileDescendantIds = new Set<number>();
+    for (const descendant of descendantRows) {
+      if (descendant.account_id !== null) fileDescendantIds.add(descendant.account_id);
+    }
+
+    let leafDebitInitialBani = 0;
+    let leafCreditInitialBani = 0;
+    let leafDebitPrevBani = 0;
+    let leafCreditPrevBani = 0;
+
+    for (const descendant of descendantRows) {
+      const descendantChildren =
+        descendant.account_id === null ? [] : childrenByParent.get(descendant.account_id) ?? [];
+      if (descendantChildren.some(id => fileDescendantIds.has(id))) continue;
+
+      leafDebitInitialBani += descendant.debit_initial_bani;
+      leafCreditInitialBani += descendant.credit_initial_bani;
+      leafDebitPrevBani += descendant.debit_prev_bani;
+      leafCreditPrevBani += descendant.credit_prev_bani;
+    }
+
+    if (
+      row.debit_initial_bani === leafDebitInitialBani &&
+      row.credit_initial_bani === leafCreditInitialBani &&
+      row.debit_prev_bani === leafDebitPrevBani &&
+      row.credit_prev_bani === leafCreditPrevBani
+    ) {
+      row.skipped_reason = 'Rând sintetic de total ignorat (egal cu suma analiticelor).';
+      row.errors = [];
+      row.warnings = [];
+    } else {
+      row.errors.push(`Dublare sintetic/analitic pentru ${row.symbol}.`);
+    }
+  }
+
+  // Stabilirea statusului final al rândurilor
+  const rows: FileImportRow[] = [];
+
+  for (const row of working) {
+    let status: FileImportRowStatus;
+    let messages: string[];
+
+    if (row.skipped_reason !== null) {
+      status = 'SKIPPED';
+      messages = [row.skipped_reason];
+    } else if (row.errors.length > 0) {
+      status = 'ERROR';
+      messages = [...row.errors, ...row.warnings];
+    } else if (!hasNonZeroSums(row)) {
+      status = 'SKIPPED';
+      messages = ['Rând fără solduri (toate sumele sunt zero).'];
+    } else if (row.warnings.length > 0) {
+      status = 'WARNING';
+      messages = [...row.warnings];
+    } else {
+      status = 'OK';
+      messages = [];
+    }
+
+    if (status === 'WARNING') {
+      for (const message of messages) warnings.push(`Rând ${row.row_no}: ${message}`);
+    }
+
+    rows.push({
+      row_no: row.row_no,
+      symbol: row.symbol,
+      name: row.name,
+      account_id: row.account_id,
+      debit_initial: fromBani(row.debit_initial_bani),
+      credit_initial: fromBani(row.credit_initial_bani),
+      debit_prev: fromBani(row.debit_prev_bani),
+      credit_prev: fromBani(row.credit_prev_bani),
+      currency: row.currency,
+      currency_amount: fromBani(row.currency_amount_bani),
+      status,
+      messages
+    });
+  }
+
+  // 6. Totaluri și verificarea echilibrului
+  let totalDebitInitialBani = 0;
+  let totalCreditInitialBani = 0;
+  let totalDebitPrevBani = 0;
+  let totalCreditPrevBani = 0;
+
+  for (const row of rows) {
+    if (row.status !== 'OK' && row.status !== 'WARNING') continue;
+    totalDebitInitialBani += toBani(row.debit_initial);
+    totalCreditInitialBani += toBani(row.credit_initial);
+    totalDebitPrevBani += toBani(row.debit_prev);
+    totalCreditPrevBani += toBani(row.credit_prev);
+  }
+
+  const isBalanced =
+    totalDebitInitialBani === totalCreditInitialBani && totalDebitPrevBani === totalCreditPrevBani;
+
+  if (!isBalanced) {
+    const parts: string[] = [];
+    if (totalDebitInitialBani !== totalCreditInitialBani) {
+      parts.push(
+        `debit inițial ${fromBani(totalDebitInitialBani).toFixed(2)} ≠ credit inițial ${fromBani(totalCreditInitialBani).toFixed(2)}`
+      );
+    }
+    if (totalDebitPrevBani !== totalCreditPrevBani) {
+      parts.push(
+        `debit precedent ${fromBani(totalDebitPrevBani).toFixed(2)} ≠ credit precedent ${fromBani(totalCreditPrevBani).toFixed(2)}`
+      );
+    }
+    errors.push(`Balanța importată nu este echilibrată: ${parts.join('; ')}.`);
+  }
+
+  // 7. Amprenta de conținut a rândurilor care se importă
+  const hashPayload = rows
+    .filter(row => row.status === 'OK' || row.status === 'WARNING')
+    .slice()
+    .sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0))
+    .map(row => [
+      row.symbol,
+      toBani(row.debit_initial),
+      toBani(row.credit_initial),
+      toBani(row.debit_prev),
+      toBani(row.credit_prev),
+      row.currency,
+      toBani(row.currency_amount)
+    ]);
+
+  const contentHash = crypto.createHash('sha256').update(JSON.stringify(hashPayload)).digest('hex');
+
+  // 8. Import deja commitat cu aceeași amprentă
+  const duplicate = db.prepare(`
+    SELECT id, created_at, user_name
+    FROM accounting_opening_imports
+    WHERE batch_id = ? AND content_hash = ? AND status = 'COMMITTED'
+    ORDER BY id ASC
+    LIMIT 1
+  `).get(batch.id, contentHash) as FileImportDuplicate | undefined;
+
+  // 9. Linii existente în lot, cu cel puțin o valoare nenulă
+  const existingLines = db.prepare(`
+    SELECT COUNT(*) AS line_count
+    FROM accounting_opening_balance_lines
+    WHERE batch_id = ?
+      AND (debit_initial != 0 OR credit_initial != 0 OR debit_prev != 0 OR credit_prev != 0)
+  `).get(batch.id) as { line_count: number };
+
+  // 10. Importul poate fi confirmat doar fără erori blocante
+  const canCommit = errors.length === 0 && !rows.some(row => row.status === 'ERROR');
+
+  return {
+    source_type: parsed.source_type,
+    rows,
+    errors,
+    warnings,
+    totals: {
+      debit_initial: fromBani(totalDebitInitialBani),
+      credit_initial: fromBani(totalCreditInitialBani),
+      debit_prev: fromBani(totalDebitPrevBani),
+      credit_prev: fromBani(totalCreditPrevBani)
+    },
+    is_balanced: isBalanced,
+    content_hash: contentHash,
+    duplicate_of: duplicate ?? null,
+    existing_lines_count: existingLines.line_count,
+    can_commit: canCommit
+  };
 }
