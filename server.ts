@@ -56,6 +56,7 @@ import {
   getAllowedCurrencies
 } from './src/server/openingBalance.js';
 import { parseImportFile, previewHeaders, previewFileImport, commitFileImport } from './src/server/openingImport.js';
+import { buildOpeningExport, buildImportTemplate } from './src/server/openingExport.js';
 import { validateCUI, validateIBAN, validateRegCom } from './src/server/validators.js';
 import { runAcceptanceTests } from './src/server/tests.js';
 import { db } from './src/server/db.js';
@@ -861,6 +862,52 @@ async function startServer() {
         lines: getOpeningBalanceLines(r.batch.id, companyId),
         verification: verifyOpeningBalance(companyId, r.batch.id)
       });
+    } catch (err: any) {
+      sendOpeningError(res, err);
+    }
+  });
+
+  app.get('/api/companies/:id/opening-balance/export', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Acces interzis.' });
+      }
+
+      const batchId = parseInt(req.query.batch_id as string, 10);
+      if (!batchId || Number.isNaN(batchId)) {
+        return res.status(400).json({ error: 'Parametrul batch_id este obligatoriu.' });
+      }
+
+      const format: 'csv' | 'xlsx' = (req.query.format as string) === 'xlsx' ? 'xlsx' : 'csv';
+      const file = buildOpeningExport(companyId, batchId, format, req.user!.id, req.user!.full_name);
+
+      res.setHeader('Content-Type', file.mime);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${file.filename}"; filename*=UTF-8''${encodeURIComponent(file.filename)}`
+      );
+      res.send(file.buffer);
+    } catch (err: any) {
+      sendOpeningError(res, err);
+    }
+  });
+
+  app.get('/api/companies/:id/opening-balance/import/template', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Acces interzis.' });
+      }
+
+      const file = buildImportTemplate(companyId);
+
+      res.setHeader('Content-Type', file.mime);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${file.filename}"; filename*=UTF-8''${encodeURIComponent(file.filename)}`
+      );
+      res.send(file.buffer);
     } catch (err: any) {
       sendOpeningError(res, err);
     }
