@@ -45,6 +45,9 @@ export type CompanyCopyRow = {
   credit_prev: number;
   currency: string;
   currency_amount: number;
+  exchange_rate: number;
+  exchange_rate_date: string | null;
+  exchange_rate_source: string;
   status: CompanyCopyRowStatus;
   messages: string[];
 };
@@ -233,6 +236,18 @@ export function previewCompanyCopy(
   // Rândurile sursă: linii de cont cu solduri, fără rândurile sintetice de total
   const sourceLines = getOpeningBalanceLines(sourceBatch.id, sourceCompanyId);
 
+  // Sursa cursului valutar nu vine în liniile citite, deci se ia direct din lotul sursă
+  const sourceRateSources = new Map<number, string>();
+  const sourceRateRows = db.prepare(`
+    SELECT account_id, exchange_rate_source
+    FROM accounting_opening_balance_lines
+    WHERE batch_id = ?
+  `).all(sourceBatch.id) as { account_id: number; exchange_rate_source: string | null }[];
+
+  for (const sourceRateRow of sourceRateRows) {
+    sourceRateSources.set(sourceRateRow.account_id, sourceRateRow.exchange_rate_source || '');
+  }
+
   const errors: string[] = [];
   const rows: CompanyCopyRow[] = [];
 
@@ -278,6 +293,9 @@ export function previewCompanyCopy(
       credit_prev: fromBani(creditPrevBani),
       currency: line.currency,
       currency_amount: fromBani(currencyAmountBani),
+      exchange_rate: line.exchange_rate || 1.0,
+      exchange_rate_date: line.exchange_rate_date ?? null,
+      exchange_rate_source: sourceRateSources.get(line.account_id) ?? '',
       status: messages.length > 0 ? 'ERROR' : 'OK',
       messages
     });
@@ -506,8 +524,9 @@ export function commitCompanyCopy(
       INSERT INTO accounting_opening_balance_lines (
         batch_id, account_id, account_symbol, debit_initial, credit_initial,
         debit_prev, credit_prev, currency, currency_amount, exchange_rate,
+        exchange_rate_date, exchange_rate_source,
         notes, value_source, source_import_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, '', 'COPY', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'COPY', ?, ?, ?)
     `);
 
     for (const row of rowsToCopy) {
@@ -521,6 +540,9 @@ export function commitCompanyCopy(
         row.credit_prev,
         row.currency,
         row.currency_amount,
+        row.exchange_rate,
+        row.exchange_rate_date,
+        row.exchange_rate_source,
         importId,
         now,
         now

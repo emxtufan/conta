@@ -47,7 +47,6 @@ import {
   getOpeningCounterparties,
   saveOpeningCounterpartyItem,
   deleteOpeningCounterpartyItem,
-  copyOpeningBalanceFromCompany,
   getOpeningValidationLogs,
   getOpeningBalances,
   setupOpeningBatch,
@@ -56,6 +55,7 @@ import {
   getAllowedCurrencies
 } from './src/server/openingBalance.js';
 import { parseImportFile, previewHeaders, previewFileImport, commitFileImport } from './src/server/openingImport.js';
+import { previewCompanyCopy, commitCompanyCopy } from './src/server/openingCopy.js';
 import { buildOpeningExport, buildImportTemplate } from './src/server/openingExport.js';
 import { validateCUI, validateIBAN, validateRegCom } from './src/server/validators.js';
 import { runAcceptanceTests } from './src/server/tests.js';
@@ -937,26 +937,40 @@ async function startServer() {
     }
   });
 
-  app.post('/api/companies/:id/opening-balance/copy-from-company', requireAuth, (req: AuthRequest, res: Response) => {
+  app.post('/api/companies/:id/opening-balance/copy-from-company/preview', requireAuth, (req: AuthRequest, res: Response) => {
     try {
-      const targetCompanyId = parseInt(req.params.id, 10);
-      const { sourceCompanyId, fiscalYear } = req.body;
+      const companyId = parseInt(req.params.id, 10);
+      const sourceCompanyId = Number(req.body?.source_company_id);
 
-      if (!checkUserCompanyAccess(req.user!.id, targetCompanyId, req.user!.role) ||
-          !checkUserCompanyAccess(req.user!.id, parseInt(sourceCompanyId, 10), req.user!.role)) {
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role) ||
+          !checkUserCompanyAccess(req.user!.id, sourceCompanyId, req.user!.role)) {
         return res.status(403).json({ error: 'Acces interzis: aveți nevoie de permisiuni pe ambele societăți.' });
       }
 
-      const result = copyOpeningBalanceFromCompany(
-        parseInt(sourceCompanyId, 10),
-        targetCompanyId,
-        parseInt(fiscalYear, 10) || new Date().getFullYear(),
-        req.user!.id,
-        req.user!.full_name
-      );
-      res.json(result);
+      res.json(previewCompanyCopy(companyId, req.body));
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      sendOpeningError(res, err);
+    }
+  });
+
+  app.post('/api/companies/:id/opening-balance/copy-from-company/commit', requireAuth, (req: AuthRequest, res: Response) => {
+    try {
+      const companyId = parseInt(req.params.id, 10);
+      const sourceCompanyId = Number(req.body?.source_company_id);
+
+      if (!checkUserCompanyAccess(req.user!.id, companyId, req.user!.role) ||
+          !checkUserCompanyAccess(req.user!.id, sourceCompanyId, req.user!.role)) {
+        return res.status(403).json({ error: 'Acces interzis: aveți nevoie de permisiuni pe ambele societăți.' });
+      }
+
+      const r = commitCompanyCopy(companyId, req.body, req.user!.id, req.user!.full_name);
+      res.json({
+        ...r,
+        lines: getOpeningBalanceLines(r.batch.id, companyId),
+        verification: verifyOpeningBalance(companyId, r.batch.id)
+      });
+    } catch (err: any) {
+      sendOpeningError(res, err);
     }
   });
 

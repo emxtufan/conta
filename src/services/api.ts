@@ -631,14 +631,41 @@ class ApiService {
     );
   }
 
-  async copyOpeningBalanceFromCompany(
-    targetCompanyId: number,
-    sourceCompanyId: number,
-    fiscalYear: number
-  ): Promise<{ success: boolean; copiedCount: number; batch: OpeningBatch }> {
-    return this.request(`/api/companies/${targetCompanyId}/opening-balance/copy-from-company`, {
+  async previewCompanyCopy(
+    companyId: number,
+    p: {
+      target_batch_id: number;
+      source_company_id: number;
+      version?: number;
+      confirm_replace?: boolean;
+      confirm_reimport?: boolean;
+    }
+  ): Promise<any> {
+    return this.request(`/api/companies/${companyId}/opening-balance/copy-from-company/preview`, {
       method: 'POST',
-      body: JSON.stringify({ sourceCompanyId, fiscalYear }),
+      body: JSON.stringify(p),
+    });
+  }
+
+  async commitCompanyCopy(
+    companyId: number,
+    p: {
+      target_batch_id: number;
+      source_company_id: number;
+      version?: number;
+      confirm_replace?: boolean;
+      confirm_reimport?: boolean;
+    }
+  ): Promise<{
+    success: boolean;
+    batch: OpeningBatch;
+    lines: OpeningBalanceLine[];
+    verification: OpeningVerificationResult;
+    note?: string;
+  }> {
+    return this.request(`/api/companies/${companyId}/opening-balance/copy-from-company/commit`, {
+      method: 'POST',
+      body: JSON.stringify(p),
     });
   }
 
