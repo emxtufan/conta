@@ -17,6 +17,7 @@ import { HomeDashboard } from './components/dashboard/HomeDashboard';
 import { AuthView } from './components/auth/AuthView';
 import { AutomaticAccountsView } from './components/accounting/AutomaticAccountsView';
 import { SettingsDiverseView } from './components/settings/SettingsDiverseView';
+import { OpeningBalanceView } from './components/opening/OpeningBalanceView';
 import { SAGA_MANUAL_ENTRIES } from './data/sagaManualData';
 import { SidebarTree } from './components/SidebarTree';
 import { ManualReader } from './components/ManualReader';
@@ -331,6 +332,17 @@ export default function App() {
             <div className="flex-1 overflow-auto p-4 sm:p-6 bg-slate-100/50 dark:bg-slate-950/40">
               <div className="max-w-6xl mx-auto">
                 <AutomaticAccountsView
+                  company={activeCompanyDetailed}
+                  onNavigateToCompanies={() => setActiveView('companies')}
+                />
+              </div>
+            </div>
+          )}
+
+          {activeView === 'opening_balance' && (
+            <div className="flex-1 overflow-auto p-4 sm:p-6 bg-slate-100/50 dark:bg-slate-950/40">
+              <div className="max-w-[1600px] mx-auto">
+                <OpeningBalanceView
                   company={activeCompanyDetailed}
                   onNavigateToCompanies={() => setActiveView('companies')}
                 />

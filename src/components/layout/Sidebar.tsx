@@ -136,13 +136,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     </span>
                   </button>
 
-                  {/* Preluare date contabile - ETAPĂ VIITOARE */}
+                  {/* Preluare date contabile - ACTIV ETAPA 4 */}
                   <button
-                    onClick={() => onOpenFutureModal('Configurare Societăți → Preluare date contabile')}
-                    className="w-full flex items-center justify-between px-2 py-1.5 rounded-md text-slate-400 hover:bg-slate-100/70 dark:hover:bg-slate-900/50 transition-colors cursor-pointer text-[11px]"
+                    onClick={() => onSelectView('opening_balance')}
+                    className={`w-full flex items-center justify-between px-2 py-1.5 rounded-md font-medium transition-colors cursor-pointer text-[11px] ${
+                      activeView === 'opening_balance'
+                        ? 'bg-blue-100 dark:bg-blue-950/80 text-blue-900 dark:text-blue-100 font-bold'
+                        : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-900'
+                    }`}
                   >
                     <span>Preluare date contabile</span>
-                    <span className="text-[9px] text-slate-400">Viitor</span>
+                    <span className="text-[9px] bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300 font-bold px-1.5 py-0.2 rounded">
+                      Etapa 4
+                    </span>
                   </button>
                 </div>
               </div>
@@ -258,7 +264,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <span className="text-emerald-600 font-medium">Operațional</span>
         </div>
         <div className="text-[10px] text-slate-400">
-          Etapa 3: Setări Diverse (Activ)
+          Etapa 4: Preluare date contabile (Activ)
         </div>
       </div>
     </aside>

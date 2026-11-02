@@ -236,7 +236,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
     setNotice(null);
     try {
       const data = await api.setupOpeningBalance(companyId, {
-        fiscal_year: setupForm.fiscal_year,
+        fiscal_year: fiscalYear,
         start_month: setupForm.start_month,
         batch_type: setupForm.batch_type,
         version: batch?.version ?? 0,
@@ -538,7 +538,7 @@ export function OpeningBalanceView({ company, onNavigateToCompanies }: OpeningBa
             Solduri de preluare
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            {company.name} · exercițiu {batch ? batch.fiscal_year : setupForm.fiscal_year} ·{' '}
+            {company.name} · exercițiu {fiscalYear} ·{' '}
             {RO_MONTHS[(batch ? batch.start_month : setupForm.start_month) - 1]}
             {batch && (
               <span className="ml-2 px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-[10px] font-semibold text-slate-600 dark:text-slate-300">
